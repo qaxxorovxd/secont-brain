@@ -1,6 +1,7 @@
-# 🧠 AI Brain — Telegram second memory
+# 🧠 AI Brain — Telegram second memory (meet **Marin**)
 
-Telegram bot + Gemini. Send it **text or voice** (uz / en) — it saves everything in time order into
+Telegram bot + Gemini. The assistant is **Marin**: she introduces herself as Marin, addresses you as
+**"janob"**, remembers everything. Send her **text or voice** (uz / en) — she saves it in time order into
 `./brain/`, tracks tasks per person, and answers later: *"kimlarga referat qilishim kerak?"*
 
 ```
@@ -28,6 +29,9 @@ Bot:  Referat — 1/5 bajarildi
 - 📎 Long answers come as `.md` / `.txt` / `.pdf` files
 - 🔄 `./brain` is its own **private git repo** → auto commit / pull / push for syncing computers
 - 🔒 Owner-only (first user who writes, or `ALLOWED_USER_IDS`)
+- 🪄 **Standing rules** — tell her "menga doim janob de" / "soat 23 dan keyin qo'ng'iroq qilma" and she
+  saves it to `brain/rules.md` and follows it from then on (`remember_rule` / `forget_rule`)
+- 🎙 Phone calls use a configurable youthful voice (`TTS_VOICE`, default `Leda`)
 
 ## Setup
 ```bash
