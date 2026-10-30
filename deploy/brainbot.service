@@ -1,0 +1,22 @@
+# systemd unit for a Linux server.
+#   sudo cp deploy/brainbot.service /etc/systemd/system/
+#   (edit User= and WorkingDirectory= below)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now brainbot
+#   journalctl -u brainbot -f        # logs
+[Unit]
+Description=AI Brain Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/ai-brain
+ExecStartPre=/usr/bin/python3 run.py --setup
+ExecStart=/usr/bin/python3 run.py --once
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

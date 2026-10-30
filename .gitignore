@@ -1,0 +1,8 @@
+# secrets & personal data — never commit
+.env
+brain/
+.state/
+__pycache__/
+*.pyc
+.venv/
+venv/
