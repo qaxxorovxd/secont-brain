@@ -37,6 +37,10 @@ class Config:
     allowed_ids: set[int] = field(default_factory=lambda: _ids("ALLOWED_USER_IDS"))
     git_sync: bool = field(default_factory=lambda: _bool("BRAIN_GIT_SYNC", True))
     digest_time: str = field(default_factory=lambda: os.getenv("DIGEST_TIME", "08:00"))
+    # user-agent (second Telegram account that phones the owner) — https://my.telegram.org
+    tg_api_id: int = field(default_factory=lambda: int(os.getenv("TG_API_ID", "0") or 0))
+    tg_api_hash: str = field(default_factory=lambda: os.getenv("TG_API_HASH", ""))
+    agent_phone: str = field(default_factory=lambda: os.getenv("AGENT_PHONE", ""))
 
     def validate(self) -> None:
         missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", self.telegram_token),

@@ -3,3 +3,5 @@ google-genai>=1.30
 python-dotenv>=1.0
 fpdf2>=2.7
 tzdata
+telethon>=1.40
+py-tgcalls>=2.2

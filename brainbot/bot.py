@@ -4,14 +4,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, time as dtime, timedelta
 from functools import wraps
 
-from telegram import BotCommand, Update
+from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup, KeyboardButton,
+                      ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
+from .agent import IMPORT_ERROR as AGENT_IMPORT_ERROR, Agent
 from .ai import Assistant, Reply
 from .config import Config
 from .export import write_file
@@ -37,7 +41,8 @@ Menga **matn** yoki **ovozli xabar** yubor — hammasini vaqt tartibida saqlayma
 /today — bugun va muddati o'tganlar
 /export — hamma vazifalar fayl qilib
 /sync — git sync (brain repo)
-/new — suhbat kontekstini tozalash"""
+/new — suhbat kontekstini tozalash
+/agent — 🤖 agent hisobi: qo'ng'iroq qilib eslatadi"""
 
 
 def render_tasks(tasks: list[dict], today: str, title: str) -> str:
@@ -73,6 +78,8 @@ class BrainBot:
         self.git = GitSync(cfg.brain_dir, cfg.git_sync, self.brain.lock)
         self.brain.on_change = self.git.mark_dirty
         self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models)
+        self.agent = Agent(cfg.tg_api_id, cfg.tg_api_hash, cfg.agent_phone, cfg.state_dir, self.ai)
+        self.login_step: str | None = None  # phone | code | password
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():
@@ -134,6 +141,8 @@ class BrainBot:
             p = write_file(self.cfg.state_dir / "out", f["title"], f["content"], f["format"])
             with p.open("rb") as fh:
                 await ctx.bot.send_document(chat, fh, filename=p.name, caption=f"📎 {f['title']}")
+        for text in reply.calls:
+            self.start_call(ctx, text)
         if self.git.dirty:
             asyncio.create_task(asyncio.to_thread(self.git.push))
 
@@ -150,6 +159,9 @@ class BrainBot:
 
     @guarded
     async def on_text(self, update: Update, ctx):
+        if self.login_step:
+            await self.login_input(update, ctx, update.effective_message.text)
+            return
         await self.think(update, ctx, update.effective_message.text, "text")
 
     @guarded
@@ -231,6 +243,162 @@ class BrainBot:
         self.ai.history.clear()
         await update.effective_message.reply_text("🧹 Kontekst tozalandi (xotira joyida).")
 
+    # ---------- agent (phone calls) ----------
+    def agent_menu(self) -> tuple[str, InlineKeyboardMarkup]:
+        a = self.agent
+        if not a.available:
+            why = AGENT_IMPORT_ERROR or "TG_API_ID / TG_API_HASH .env da yo'q"
+            return f"🤖 **Agent**\n\n⚠️ Ishlamaydi: `{why[:200]}`", InlineKeyboardMarkup([])
+        if not a.linked:
+            return ("🤖 **Agent** — ikkinchi Telegram hisobi\n\n"
+                    "Eslatma vaqti kelganda sizga **qo'ng'iroq qiladi**, ovozli xabarni o'qiydi va "
+                    "_\"Qaytaraymi?\"_ deb so'raydi. **Ha** desangiz — yana qaytaradi.\n\n"
+                    "Holat: ❌ ulanmagan",
+                    InlineKeyboardMarkup([[Btn("🔗 Hisobni ulash", callback_data="ag:link")]]))
+        on = a.calls_enabled
+        status = "✅ tayyor" if a.ready else "⚠️ ulangan, lekin ishga tushmadi (loglarni ko'ring)"
+        return (f"🤖 **Agent**\n\n👤 {a.me}\n📡 Holat: {status}\n"
+                f"🔔 Eslatmalarda qo'ng'iroq: **{'yoqilgan' if on else 'o‘chirilgan'}**",
+                InlineKeyboardMarkup([
+                    [Btn("📞 Test qo'ng'iroq", callback_data="ag:test")],
+                    [Btn(f"🔔 Qo'ng'iroq: {'ON ✅' if on else 'OFF ❌'}", callback_data="ag:toggle")],
+                    [Btn("🔌 Hisobni uzish", callback_data="ag:unlink")],
+                ]))
+
+    @guarded
+    async def on_agent(self, update: Update, ctx):
+        text, kb = self.agent_menu()
+        await update.effective_message.reply_text(md_to_html(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    @guarded
+    async def on_agent_button(self, update: Update, ctx):
+        q = update.callback_query
+        await q.answer()
+        action = q.data.split(":", 1)[1]
+        if action == "link":
+            self.login_step = "phone"
+            kb = [[Btn(f"✅ {self.cfg.agent_phone}", callback_data="ag:phone")]] if self.cfg.agent_phone else []
+            kb.append([Btn("✖️ Bekor qilish", callback_data="ag:cancel")])
+            await q.message.reply_text(md_to_html(
+                "📱 Agent hisobining **telefon raqami**?\nTugmani bosing yoki raqamni yozing (`+998…`)."),
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if action == "phone":
+            await self.login_input(update, ctx, self.cfg.agent_phone)
+            return
+        if action == "cancel":
+            self.login_step = None
+            await self.agent.login_cancel()
+            await q.message.reply_text("✖️ Bekor qilindi.")
+            return
+        if action == "test":
+            self.start_call(ctx, "Assalomu alaykum! Bu Brain yordamchingiz. Test qo'ng'iroq: hammasi ishlayapti")
+            await q.message.reply_text("📞 Qo'ng'iroq qilinyapti…")
+            return
+        if action == "toggle":
+            self.agent.set_calls(not self.agent.calls_enabled)
+        elif action == "unlink":
+            await self.agent.unlink()
+            await q.message.reply_text("🔌 Agent hisobi uzildi.")
+        text, kb = self.agent_menu()
+        try:
+            await q.edit_message_text(md_to_html(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
+
+    async def login_input(self, update: Update, ctx, text: str) -> None:
+        chat = update.effective_chat.id
+        msg = update.effective_message
+        step = self.login_step
+        try:
+            if step == "phone":
+                phone = "+" + re.sub(r"\D", "", text)
+                await self.agent.login_phone(phone)
+                self.login_step = "code"
+                await self.send_md(chat, ctx,
+                    f"🔐 Kod **{phone}** hisobiga (Telegram ilovasiga) yuborildi.\n\n"
+                    "Kodni **bo'shliq bilan** yozing, masalan: `1 2 3 4 5`\n"
+                    "_(kodni bitta raqam qilib yuborsangiz, Telegram uni bekor qilishi mumkin)_")
+            elif step == "code":
+                await self._delete(msg)
+                if await self.agent.login_code(re.sub(r"\D", "", text)) == "password":
+                    self.login_step = "password"
+                    await self.send_md(chat, ctx, "🔑 Hisobda **2 bosqichli parol** bor. Parolni yuboring "
+                                                  "_(xabaringiz darhol o'chiriladi)_.")
+                    return
+                await self.login_done(update, ctx)
+            elif step == "password":
+                await self._delete(msg)
+                await self.agent.login_password(text.strip())
+                await self.login_done(update, ctx)
+        except Exception as e:
+            log.warning("agent login (%s) failed: %s", step, e)
+            await self.send_md(chat, ctx, f"⚠️ {type(e).__name__}: `{str(e)[:200]}`\n"
+                                          "Qayta yozing yoki /agent → 🔗 Hisobni ulash.")
+            if step == "phone" or "expired" in str(e).lower():
+                self.login_step = None
+                await self.agent.login_cancel()
+
+    async def login_done(self, update: Update, ctx) -> None:
+        self.login_step = None
+        chat = update.effective_chat.id
+        user = update.effective_user
+        ok = await self.agent.resolve_owner(user.id, user.username or "")
+        await self.send_md(chat, ctx, f"✅ **Ulandi:** {self.agent.me}")
+        if not ok:
+            await self.ask_contact(chat, ctx)
+            return
+        await self.send_md(chat, ctx,
+            "📞 Endi /agent → **Test qo'ng'iroq** bosing.\n\n"
+            "_Qo'ng'iroq kelmasa: Sozlamalar → Maxfiylik → Qo'ng'iroqlar — agent raqamiga ruxsat bering "
+            "(yoki uni kontaktlarga qo'shing)._")
+
+    async def ask_contact(self, chat: int, ctx) -> None:
+        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Raqamimni yuborish", request_contact=True)]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await ctx.bot.send_message(chat, md_to_html(
+            "📇 Agent sizni topa olmadi. Qo'ng'iroq qila olishi uchun pastdagi tugma bilan "
+            "**raqamingizni yuboring** (faqat agent kontaktiga qo'shiladi)."),
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    @guarded
+    async def on_contact(self, update: Update, ctx):
+        contact = update.effective_message.contact
+        if contact.user_id != update.effective_user.id:
+            await update.effective_message.reply_text("Faqat o'zingizning raqamingizni yuboring.")
+            return
+        ok = await self.agent.resolve_owner(contact.user_id, update.effective_user.username or "",
+                                            contact.phone_number)
+        await update.effective_message.reply_text(
+            "✅ Topildi. /agent → 📞 Test qo'ng'iroq" if ok
+            else "⚠️ Baribir topilmadi. Agent hisobiga bitta xabar yozing va qayta urining.",
+            reply_markup=ReplyKeyboardRemove())
+
+    @staticmethod
+    async def _delete(msg) -> None:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    def start_call(self, ctx, text: str) -> None:
+        if not (self.agent.ready and self.owner_chat):
+            return
+
+        async def run():
+            try:
+                status = await self.agent.call(self.owner_chat, text)
+            except Exception as e:
+                log.exception("call failed")
+                status = f"xatolik: {e}"
+            if status == "owner_unknown":
+                await self.ask_contact(self.owner_chat, ctx)
+                return
+            await self.send_md(self.owner_chat, ctx, f"📞 _Qo'ng'iroq: {status}_")
+            self.brain.log(f"[call] {text}\n→ {status}", "call")
+
+        asyncio.create_task(run())
+
     # ---------- jobs ----------
     def digest_text(self) -> str:
         now = self.brain.now()
@@ -265,29 +433,45 @@ class BrainBot:
             details = f"\n_{t['details']}_" if t.get("details") else ""
             await self.send_md(self.owner_chat, ctx, f"🔔 **Eslatma**\n{name}{when}{details}")
             self.brain.mark_reminded(t["id"])
+            if self.agent.calls_enabled:
+                spoken = f"Assalomu alaykum! Eslatma: {name}."
+                if t.get("time"):
+                    spoken += f" Vaqti: soat {t['time']}."
+                if t.get("details"):
+                    spoken += f" {t['details']}."
+                self.start_call(ctx, spoken)
 
     async def job_sync(self, ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(self.git.push)
         await asyncio.to_thread(self.git.pull)
 
     async def post_init(self, app: Application):
+        await self.agent.start()
         await app.bot.set_my_commands([
+            BotCommand("agent", "🤖 Agent: qo'ng'iroq / hisob ulash"),
             BotCommand("tasks", "Ochiq vazifalar"), BotCommand("today", "Bugungi reja"),
             BotCommand("export", "Hammasini faylga"), BotCommand("sync", "Git sync"),
             BotCommand("new", "Kontekstni tozalash"), BotCommand("help", "Yordam"),
         ])
 
+    async def post_shutdown(self, app: Application):
+        await self.agent.stop()
+
     # ---------- run ----------
     def run(self):
         if self.git.enabled:
             log.info("git sync: %s", self.git.pull())
-        app = Application.builder().token(self.cfg.telegram_token).post_init(self.post_init).build()
+        app = (Application.builder().token(self.cfg.telegram_token)
+               .post_init(self.post_init).post_shutdown(self.post_shutdown).build())
         app.add_handler(CommandHandler(["start", "help"], self.on_start))
         app.add_handler(CommandHandler("tasks", self.on_tasks))
         app.add_handler(CommandHandler("today", self.on_today))
         app.add_handler(CommandHandler("export", self.on_export))
         app.add_handler(CommandHandler("sync", self.on_sync))
         app.add_handler(CommandHandler("new", self.on_new))
+        app.add_handler(CommandHandler("agent", self.on_agent))
+        app.add_handler(CallbackQueryHandler(self.on_agent_button, pattern=r"^ag:"))
+        app.add_handler(MessageHandler(filters.CONTACT, self.on_contact))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))

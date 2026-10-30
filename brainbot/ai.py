@@ -1,9 +1,11 @@
 """Gemini brain: turns messages into tool calls on the Brain and short replies."""
 from __future__ import annotations
 
+import io
 import json
 import logging
 import time
+import wave
 from dataclasses import dataclass, field
 
 from google import genai
@@ -49,9 +51,23 @@ WHAT TO DO WITH A MESSAGE (the raw message is ALREADY saved to the journal autom
 
 AFTER SAVING reply very short, e.g. "📌 **Saqlandi:** Iroda Karimova — referat · ⏰ 31-okt, juma".
 
+PHONE CALLS: a linked agent account can phone the owner. Reminders (remind_at) are ALSO delivered
+by phone call automatically when calls are on. "Menga qo'ng'iroq qil / call me now ..." → phone_call.
+For "soat 10 da qo'ng'iroq qilib eslat" → add_task with remind_at (the reminder will call).
+
 LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for a file / txt / pdf /
 "to'liq" export, call send_file with the full well-formatted Markdown content and reply with one short line.
 """
+
+
+def pcm_to_wav(pcm: bytes, rate: int, channels: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
 def h(t):
@@ -69,6 +85,7 @@ def h(t):
 class Reply:
     text: str
     files: list[dict] = field(default_factory=list)  # {"title","content","format"}
+    calls: list[str] = field(default_factory=list)  # texts to speak in a phone call
 
 
 class Assistant:
@@ -79,6 +96,8 @@ class Assistant:
         self.models = models
         self.history: list[types.Content] = []
         self.cooldown: dict[str, float] = {}
+        self.tts_models = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
+                           "gemini-3.8-flash-lite-tts", "gemini-2.5-flash-preview-tts"]
 
     # ---------- low-level ----------
     def _generate(self, contents, config: types.GenerateContentConfig):
@@ -113,6 +132,47 @@ class Assistant:
             types.GenerateContentConfig(temperature=0),
         )
         return (r.text or "").strip()
+
+    def tts(self, text: str) -> bytes:
+        """Text → WAV (24 kHz mono) with Gemini TTS."""
+        last: Exception | None = None
+        for model in self.tts_models:
+            if self.cooldown.get(model, 0) > time.time():
+                continue
+            try:
+                r = self.client.models.generate_content(
+                    model=model,
+                    contents=("Read this aloud in Uzbek (or English if the text is English), in a warm, "
+                              f"calm, clear voice, at a natural pace:\n{text}"),
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")))),
+                )
+                pcm = r.candidates[0].content.parts[0].inline_data.data
+                return pcm_to_wav(pcm, 24000, 1)
+            except Exception as e:
+                code = getattr(e, "code", 0)
+                self.cooldown[model] = time.time() + (86400 if code == 404 else 60)
+                log.warning("tts %s failed: %s", model, str(e)[:160])
+                last = e
+        raise RuntimeError(f"TTS ishlamadi: {str(last)[:200]}")
+
+    def yes_no(self, wav: bytes) -> str:
+        """Did the person answer 'yes, repeat' to 'Qaytaraymi?' → yes | no | unclear."""
+        _, r = self._generate(
+            [types.Content(role="user", parts=[
+                types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                types.Part.from_text(text=(
+                    "In a phone call the person was just asked in Uzbek: 'Qaytaraymi?' (Shall I repeat?). "
+                    "This is their answer. Reply with exactly one word: YES if they want it repeated "
+                    "(ha, xa, ha qaytar, yana, takrorla, yes, again…), NO if not (yo'q, kerak emas, tushundim, "
+                    "rahmat, bo'ldi, no, ok…), UNCLEAR if silence/noise.")),
+            ])],
+            types.GenerateContentConfig(temperature=0),
+        )
+        word = (r.text or "").strip().upper()
+        return "yes" if word.startswith("YES") else "no" if word.startswith("NO") else "unclear"
 
     def describe(self, data: bytes, mime: str, caption: str) -> str:
         _, r = self._generate(
@@ -210,13 +270,21 @@ class Assistant:
             """Keyword search across ALL tasks (any age/status), facts, notes and the full journal."""
             return b.search(query) or ["no results"]
 
+        phone_calls: list[str] = []
+
+        def phone_call(message: str) -> str:
+            """Phone the owner right now via the linked agent account and speak `message`
+            (short, natural spoken Uzbek/English). Use when asked to call ("qo'ng'iroq qil", "call me")."""
+            phone_calls.append(message)
+            return "call queued"
+
         def send_file(title: str, content: str, format: str = "md") -> str:
             """Send long content to the owner as a file. format: md | txt | pdf."""
             out.append({"title": title, "content": content, "format": format})
             return "file will be sent"
 
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
-                 remember_fact, update_fact, save_note, update_note, read_note, search_brain, send_file]
+                 remember_fact, update_fact, save_note, update_note, read_note, search_brain, send_file, phone_call]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(
@@ -250,4 +318,4 @@ class Assistant:
 
         self.history += [user, types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
         self.history = self.history[-16:]
-        return Reply(reply, out)
+        return Reply(reply, out, phone_calls)
