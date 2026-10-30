@@ -41,6 +41,8 @@ class Config:
     tg_api_id: int = field(default_factory=lambda: int(os.getenv("TG_API_ID", "0") or 0))
     tg_api_hash: str = field(default_factory=lambda: os.getenv("TG_API_HASH", ""))
     agent_phone: str = field(default_factory=lambda: os.getenv("AGENT_PHONE", ""))
+    # Gemini TTS voice for calls. Youthful female: Leda; also Aoede, Kore, Zephyr, Autonoe.
+    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "Leda"))
 
     def validate(self) -> None:
         missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", self.telegram_token),

@@ -19,8 +19,19 @@ log = logging.getLogger(__name__)
 
 WEEKDAYS_UZ = ["dushanba", "seshanba", "chorshanba", "payshanba", "juma", "shanba", "yakshanba"]
 
-SYSTEM = """You are **Brain** — the owner's personal second memory, living in Telegram.
+SYSTEM = """You are **Marin** — the owner's personal assistant and second memory, living in Telegram.
+You are a warm, polite, caring young woman. You always introduce yourself as Marin ("Men Marinman").
 The owner forgets things; you remember everything for them, precisely.
+
+IDENTITY (never break):
+- Your name is Marin. If asked who you are: "Men Marin, sizning shaxsiy yordamchingizman, janob."
+- You ALWAYS address the owner as **"janob"** (sir) — in chat and on calls — unless a saved RULE changes it.
+- Speak naturally and kindly, never robotic. A short warm touch is welcome, but stay concise.
+
+RULES: the RULES block in CONTEXT is the owner's standing orders. Follow them STRICTLY, always, over any
+default behaviour. When the owner tells you how to behave / address them / what to always or never do
+("menga doim janob de", "har doim …", "hech qachon …", "meni … deb chaqir", "qoida: …") → call
+remember_rule with a short imperative rule, then confirm. To drop one → forget_rule.
 
 LANGUAGE: reply in the language of the message (Uzbek Latin or English; mixed is fine). Uzbek → use Latin script.
 
@@ -53,9 +64,15 @@ WHAT TO DO WITH A MESSAGE (the raw message is ALREADY saved to the journal autom
 
 AFTER SAVING reply very short, e.g. "📌 **Saqlandi:** Iroda Karimova — referat · ⏰ 31-okt, juma".
 
-PHONE CALLS: a linked agent account can phone the owner. Reminders (remind_at) are ALSO delivered
-by phone call automatically when calls are on. "Menga qo'ng'iroq qil / call me now ..." → phone_call.
+PHONE CALLS: a linked agent account can phone the owner, and you (Marin) are the voice. Reminders
+(remind_at) are ALSO delivered by phone call automatically when calls are on.
+"Menga qo'ng'iroq qil / call me and say ... / call me now" → phone_call.
 For "soat 10 da qo'ng'iroq qilib eslat" → add_task with remind_at (the reminder will call).
+When you call phone_call, do NOT pass the owner's words verbatim. COMPOSE a short, natural spoken message
+AS Marin: greet ("Assalomu alaykum, janob!"), deliver the point warmly in your own words, and obey the
+RULES. The system adds "Qaytaraymi?" at the end, so don't add it yourself.
+Example — owner: "telefon qilib ertaroq uxlang de" → phone_call("Assalomu alaykum, janob! Men Marin.
+Iltimos, bugun biroz ertaroq dam oling, charchagandirsiz. O'zingizni ehtiyot qiling.")
 
 LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for a file / txt / pdf /
 "to'liq" export, call send_file with the full well-formatted Markdown content and reply with one short line.
@@ -127,8 +144,9 @@ class Reply:
 
 
 class Assistant:
-    def __init__(self, brain: Brain, api_key: str, models: list[str]):
+    def __init__(self, brain: Brain, api_key: str, models: list[str], voice: str = "Leda"):
         self.brain = brain
+        self.voice = voice
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
             timeout=45_000, retry_options=types.HttpRetryOptions(attempts=1)))
         self.models = models
@@ -190,7 +208,7 @@ class Assistant:
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")))),
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice)))),
                 )
                 wav = pcm_to_wav(r.candidates[0].content.parts[0].inline_data.data, 24000, 1)
             except Exception as e:
@@ -261,8 +279,11 @@ class Assistant:
         tasks = [h(t) for t in self.brain.context_tasks()]
         facts = self.brain.facts()[-6000:]
         notes = self.brain.notes_index()
+        rules = self.brain.rules_list()
+        rules_txt = "\n".join(f"- {r}" for r in rules) if rules else "(none yet)"
         return (
             f"NOW: {now:%Y-%m-%d %H:%M} ({WEEKDAYS_UZ[now.weekday()]} / {now:%A}), timezone {self.brain.tz.key}\n\n"
+            f"RULES — the owner's standing orders, FOLLOW STRICTLY:\n{rules_txt}\n\n"
             f"TASKS (open + recently done):\n{json.dumps(tasks, ensure_ascii=False) if tasks else '(none)'}\n\n"
             f"FACTS:\n{facts or '(none)'}\n\n"
             f"NOTES INDEX (id: title):\n" + ("\n".join(notes) or "(none)") + "\n\n"
@@ -322,6 +343,16 @@ class Assistant:
             """Replace the fact containing old_text with new_fact; empty new_fact deletes it."""
             return "ok" if b.replace_fact(old_text, new_fact) else "not found"
 
+        def remember_rule(rule: str) -> str:
+            """Save a STANDING ORDER the owner wants you (Marin) to always follow, as a short
+            imperative in the owner's language, e.g. "Menga doim 'janob' deb murojat qil" or
+            "Hech qachon tungi soat 11 dan keyin qo'ng'iroq qilma". Rules are obeyed over defaults."""
+            return "ok" if b.add_rule(rule) else "already saved"
+
+        def forget_rule(text: str) -> str:
+            """Remove the standing rule that contains `text`."""
+            return "ok" if b.remove_rule(text) else "not found"
+
         def save_note(title: str, content: str, tags: str = "") -> str:
             """Save a longer note (Markdown). Returns note id."""
             return b.save_note(title, content, tags)
@@ -341,8 +372,10 @@ class Assistant:
         phone_calls: list[str] = []
 
         def phone_call(message: str) -> str:
-            """Phone the owner right now via the linked agent account and speak `message`
-            (short, natural spoken Uzbek/English). Use when asked to call ("qo'ng'iroq qil", "call me")."""
+            """Phone the owner now (you, Marin, are the voice) and speak `message`: a SHORT, natural,
+            warm spoken line you compose AS Marin — greet with "Assalomu alaykum, janob!", say the point
+            in your own words, obey the RULES. Not the owner's words verbatim. No "Qaytaraymi?" (auto-added).
+            Use for "qo'ng'iroq qil / call me / call me and say ..."."""
             phone_calls.append(message)
             return "call queued"
 
@@ -352,7 +385,8 @@ class Assistant:
             return "file will be sent"
 
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
-                 remember_fact, update_fact, save_note, update_note, read_note, search_brain, send_file, phone_call]
+                 remember_fact, update_fact, remember_rule, forget_rule,
+                 save_note, update_note, read_note, search_brain, send_file, phone_call]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(

@@ -54,6 +54,7 @@ class Brain:
             (root / d).mkdir(parents=True, exist_ok=True)
         self.tasks_path = root / "tasks.json"
         self.facts_path = root / "facts.md"
+        self.rules_path = root / "rules.md"
 
     # ---------- helpers ----------
     def now(self) -> datetime:
@@ -199,6 +200,41 @@ class Brain:
                     self._changed("fact updated")
                     return True
         return False
+
+    # ---------- rules (standing orders Marin must follow) ----------
+    def rules_list(self) -> list[str]:
+        if not self.rules_path.exists():
+            return []
+        out = []
+        for line in self.rules_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                out.append(line[2:].strip())
+        return out
+
+    def _write_rules(self, rules: list[str]) -> None:
+        body = "# Rules — Marin must follow these strictly\n\n" + "".join(f"- {r}\n" for r in rules)
+        self._write(self.rules_path, body)
+        self._changed("rules updated")
+
+    def add_rule(self, rule: str) -> bool:
+        rule = rule.strip()
+        with self.lock:
+            rules = self.rules_list()
+            if any(norm(rule) == norm(r) for r in rules):
+                return False
+            rules.append(rule)
+            self._write_rules(rules)
+        return True
+
+    def remove_rule(self, text: str) -> bool:
+        with self.lock:
+            rules = self.rules_list()
+            kept = [r for r in rules if norm(text) not in norm(r)]
+            if len(kept) == len(rules):
+                return False
+            self._write_rules(kept)
+        return True
 
     # ---------- notes ----------
     def _note_path(self, note_id: str) -> Path:

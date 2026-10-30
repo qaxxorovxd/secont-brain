@@ -25,16 +25,16 @@ from .tgformat import md_to_html
 
 log = logging.getLogger(__name__)
 
-HELP = """🧠 **Brain** — ikkinchi xotirang
+HELP = """🧠 **Marin** — sizning shaxsiy yordamchingiz, janob
 
-Menga **matn** yoki **ovozli xabar** yubor — hammasini vaqt tartibida saqlayman, keyin so'rasang topib beraman.
+Men hammasini eslab qolaman. Menga **matn** yoki **ovozli xabar** yuboring — vaqt tartibida saqlayman, keyin so'rasangiz topib beraman.
 
 **Misollar**
 - _Iroda Karimovaga juma kunigacha referat qilishim kerak_
 - _Irodaga qildim_
 - _Kimlarga referat qilishim kerak?_
 - _Ertaga 15:00 da eslat: dorixona_
-- _Alining tug'ilgan kuni 5-mart_
+- _Menga doim janob deb murojat qil_ (qoida sifatida saqlayman)
 
 **Buyruqlar**
 /tasks — ochiq vazifalar
@@ -77,7 +77,7 @@ class BrainBot:
         self.brain = Brain(cfg.brain_dir, cfg.tz)
         self.git = GitSync(cfg.brain_dir, cfg.git_sync, self.brain.lock)
         self.brain.on_change = self.git.mark_dirty
-        self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models)
+        self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models, cfg.tts_voice)
         self.agent = Agent(cfg.tg_api_id, cfg.tg_api_hash, cfg.agent_phone, cfg.state_dir, self.ai)
         self.login_step: str | None = None  # phone | code | password
         self._call_tasks: set[asyncio.Task] = set()
@@ -293,7 +293,8 @@ class BrainBot:
             await q.message.reply_text("✖️ Bekor qilindi.")
             return
         if action == "test":
-            ok = self.start_call(ctx, "Assalomu alaykum! Bu Brain yordamchingiz. Test qo'ng'iroq: hammasi ishlayapti")
+            ok = self.start_call(ctx, "Assalomu alaykum, janob! Men Marin, sizning yordamchingiz. "
+                                      "Bu test qo'ng'irog'i, hammasi joyida ishlayapti")
             await q.message.reply_text("📞 Qo'ng'iroq qilinyapti…" if ok
                                        else "⏳ Qo'ng'iroq allaqachon ketyapti, tugashini kuting.")
             return
@@ -443,7 +444,7 @@ class BrainBot:
             await self.send_md(self.owner_chat, ctx, f"🔔 **Eslatma**\n{name}{when}{details}")
             self.brain.mark_reminded(t["id"])
             if self.agent.calls_enabled:
-                spoken = f"Assalomu alaykum! Eslatma: {name}."
+                spoken = f"Assalomu alaykum, janob! Men Marin. Sizda eslatma bor: {name}."
                 if t.get("time"):
                     spoken += f" Vaqti: soat {t['time']}."
                 if t.get("details"):
