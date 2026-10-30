@@ -55,6 +55,17 @@ journalctl -u brainbot -f                          # logs
 ```
 Without systemd: `nohup python3 run.py > bot.log 2>&1 &` (or inside `tmux`).
 
+## 📞 Agent — phone-call reminders
+A second Telegram **user** account phones you when a reminder fires, reads it aloud (Gemini TTS)
+and asks *"Qaytaraymi?"* — say **"ha"** and it repeats (up to 3×).
+
+1. Get `api_id` / `api_hash` at <https://my.telegram.org> → put `TG_API_ID`, `TG_API_HASH`, `AGENT_PHONE` in `.env`.
+2. In the bot: **/agent → 🔗 Hisobni ulash** → login code (type it with spaces: `1 2 3 4 5`) → 2FA password if any.
+3. **/agent → 📞 Test qo'ng'iroq**. If the call doesn't ring: Settings → Privacy → Calls → allow the agent.
+
+You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq qilib eslat"*.
+The session is stored in `.state/agent.json` (never in git). Server needs `ffmpeg`.
+
 ## Sync (`./brain` = separate private repo)
 Create an **empty private repo** on GitHub (e.g. `my-brain`), then:
 ```bash
