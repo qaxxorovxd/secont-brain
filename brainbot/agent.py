@@ -50,6 +50,8 @@ class Agent:
         self._ended: dict[int, asyncio.Future] = {}
         self._rec: dict[int, bytearray] = {}
         self._gone: set[int] = set()
+        self._frames_seen: dict[int, int] = {}
+        self.busy = 0  # calls running or waiting for the lock (counted by the bot)
 
     # ---------- state ----------
     @property
@@ -112,8 +114,9 @@ class Agent:
             if fut and not fut.done():
                 fut.set_result(True)
 
-        @self.calls.on_update(fl.stream_frame(Direction.INCOMING, Device.MICROPHONE))
+        @self.calls.on_update(fl.stream_frame(Direction.INCOMING, Device.MICROPHONE | Device.SPEAKER))
         async def _frames(_, u):
+            self._frames_seen[u.chat_id] = self._frames_seen.get(u.chat_id, 0) + len(u.frames)
             buf = self._rec.get(u.chat_id)
             if buf is not None:
                 for f in u.frames:
@@ -121,6 +124,7 @@ class Agent:
 
         @self.calls.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
         async def _left(_, u):
+            log.info("call %s left/discarded: %s", u.chat_id, u.status)
             self._gone.add(u.chat_id)
             fut = self._ended.get(u.chat_id)
             if fut and not fut.done():
@@ -224,15 +228,21 @@ class Agent:
         path.write_bytes(wav)
         return path
 
-    async def _play_and_wait(self, uid: int, path: Path, seconds: float) -> bool:
-        """Play a file; True when it finished, False if the owner hung up."""
-        fut = self._ended[uid] = asyncio.get_running_loop().create_future()
-        await self.calls.play(uid, MediaStream(str(path), AudioQuality.HIGH,
-                                               video_flags=MediaStream.Flags.IGNORE))
+    @staticmethod
+    def _stream(path: Path) -> "MediaStream":
+        return MediaStream(str(path), AudioQuality.HIGH, video_flags=MediaStream.Flags.IGNORE)
+
+    async def _wait_end(self, uid: int, fut: asyncio.Future, seconds: float) -> bool:
+        """True when the clip finished playing, False if the owner hung up."""
         try:
-            return await asyncio.wait_for(fut, timeout=seconds + 15)
-        except asyncio.TimeoutError:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=seconds + 10)
+        except asyncio.TimeoutError:  # no StreamEnded event: assume it finished
             return uid not in self._gone
+
+    async def _play_and_wait(self, uid: int, path: Path, seconds: float) -> bool:
+        fut = self._ended[uid] = asyncio.get_running_loop().create_future()
+        await asyncio.wait_for(self.calls.play(uid, self._stream(path)), timeout=15)
+        return await self._wait_end(uid, fut, seconds)
 
     async def _listen(self, uid: int) -> str:
         self._rec[uid] = bytearray()
@@ -241,61 +251,113 @@ class Agent:
                 break
             await asyncio.sleep(0.1)
         pcm = bytes(self._rec.pop(uid, b""))
-        if uid in self._gone or len(pcm) < REC_RATE * REC_CHANNELS * 2 // 2:  # < 0.5 s
-            return "unclear"
-        return await asyncio.to_thread(self.ai.yes_no, pcm_to_wav(pcm, REC_RATE, REC_CHANNELS))
+        log.info("call %s: listened %.1fs of audio (frames so far %d)", uid,
+                 len(pcm) / (REC_RATE * REC_CHANNELS * 2), self._frames_seen.get(uid, 0))
+        if uid in self._gone:
+            return "hung_up"
+        if len(pcm) < REC_RATE * REC_CHANNELS * 2 // 2:  # < 0.5 s: recording not working
+            return "no_audio"
+        answer = await asyncio.to_thread(self.ai.yes_no, pcm_to_wav(pcm, REC_RATE, REC_CHANNELS))
+        log.info("call %s: answer=%s", uid, answer)
+        return answer
 
     @staticmethod
     def _duration(path: Path) -> float:
         with wave.open(str(path)) as w:
             return w.getnframes() / w.getframerate()
 
+    async def _hangup(self, uid: int) -> None:
+        """Leave the call and make sure py-tgcalls forgets it, whatever state it is in."""
+        try:
+            await asyncio.wait_for(self.calls.leave_call(uid), timeout=10)
+        except Exception as e:
+            log.info("call %s: leave_call: %s", uid, type(e).__name__)
+        try:  # private API, best effort: drop half-open connections that leave_call can't see
+            await asyncio.wait_for(self.calls._clear_call(uid), timeout=5)
+        except Exception:
+            pass
+        await asyncio.sleep(3)  # let Telegram release the line, otherwise the next call is "busy"
+
+    async def _dial(self, uid: int, path: Path) -> str:
+        """Ring the owner and start playing. Returns 'ok' or a failure status."""
+        for attempt in range(2):
+            try:
+                await asyncio.wait_for(self.calls.play(uid, self._stream(path), CallConfig(timeout=45)),
+                                       timeout=75)
+                return "ok"
+            except TimedOutAnswer:
+                return "javob berilmadi"
+            except CallDeclined:
+                return "rad etildi"
+            except CallBusy:
+                log.info("call %s: busy (attempt %d)", uid, attempt + 1)
+                await self._hangup(uid)
+                await asyncio.sleep(10)
+            except (CallDiscarded, asyncio.TimeoutError) as e:
+                log.warning("call %s: dial failed: %s", uid, type(e).__name__)
+                await self._hangup(uid)
+                return "ulanib bo'lmadi"
+        return "band (boshqa qo'ng'iroqda)"
+
     async def call(self, uid: int, text: str) -> str:
         """Phone the owner, read `text`, then 'Qaytaraymi?' → repeat on 'ha'.
-        Returns a short status for the chat."""
+        Returns a short status for the chat. Never hangs: the whole call is capped at 5 min."""
         if not self.ready:
             return "agent ulanmagan"
         async with self.lock:
-            if not await self._owner_ready(uid):
-                return "owner_unknown"
-            msg = await self._audio(text.rstrip(".!?") + ". Qaytaraymi?", f"msg-{int(time.time())}")
-            bye = self.audio_dir / "bye.wav"
-            if not bye.exists():
-                bye = await self._audio("Xo'p. Omad!", "bye")
-            self._gone.discard(uid)
-            length = self._duration(msg)
-            fut = self._ended[uid] = asyncio.get_running_loop().create_future()
             try:
-                await self.calls.play(uid, MediaStream(str(msg), AudioQuality.HIGH,
-                                                       video_flags=MediaStream.Flags.IGNORE),
-                                      CallConfig(timeout=45))
-            except TimedOutAnswer:
-                return "javob berilmadi"
-            except (CallDeclined, CallBusy, CallDiscarded) as e:
-                return f"qabul qilinmadi ({type(e).__name__})"
-            heard = []
+                return await asyncio.wait_for(self._call(uid, text), timeout=300)
+            except asyncio.TimeoutError:
+                log.warning("call %s: timed out, hanging up", uid)
+                await self._hangup(uid)
+                return "vaqt tugadi"
+
+    async def _call(self, uid: int, text: str) -> str:
+        if not await self._owner_ready(uid):
+            return "owner_unknown"
+        msg = await self._audio(text.rstrip(".!?") + ". Qaytaraymi?", f"msg-{int(time.time())}")
+        bye = self.audio_dir / "bye.wav"
+        if not bye.exists():
+            bye = await self._audio("Xo'p. Omad!", "bye")
+        length = self._duration(msg)
+        self._gone.discard(uid)
+        self._frames_seen[uid] = 0
+        fut = self._ended[uid] = asyncio.get_running_loop().create_future()
+        log.info("call %s: dialing (%.1fs message)", uid, length)
+        status = await self._dial(uid, msg)
+        if status != "ok":
+            self._ended.pop(uid, None)
+            msg.unlink(missing_ok=True)
+            log.info("call %s: %s", uid, status)
+            return status
+        log.info("call %s: answered", uid)
+        heard: list[str] = []
+        try:
             try:
-                await self.calls.record(uid, RecordStream(True, AudioQuality.HIGH))
-                try:
-                    finished = await asyncio.wait_for(fut, timeout=length + 15)
-                except asyncio.TimeoutError:
-                    finished = uid not in self._gone
-                for _ in range(MAX_REPEATS):
-                    if not finished:
-                        break
-                    answer = await self._listen(uid)
-                    heard.append(answer)
-                    if answer != "yes":
-                        break
-                    finished = await self._play_and_wait(uid, msg, length)
-                if uid not in self._gone:
-                    await self._play_and_wait(uid, bye, self._duration(bye))
-            finally:
-                try:
-                    await self.calls.leave_call(uid)
-                except Exception:
-                    pass
-                self._ended.pop(uid, None)
-                msg.unlink(missing_ok=True)
-            repeats = heard.count("yes")
-            return "gaplashildi" + (f", {repeats} marta qaytarildi" if repeats else "")
+                await asyncio.wait_for(self.calls.record(uid, RecordStream(True, AudioQuality.HIGH)), timeout=15)
+            except Exception as e:
+                log.warning("call %s: record failed: %s", uid, e)
+            finished = await self._wait_end(uid, fut, length)
+            for _ in range(MAX_REPEATS):
+                if not finished:
+                    break
+                answer = await self._listen(uid)
+                heard.append(answer)
+                if answer != "yes":
+                    break
+                finished = await self._play_and_wait(uid, msg, length)
+            if uid not in self._gone:
+                await self._play_and_wait(uid, bye, self._duration(bye))
+        except Exception as e:
+            log.exception("call %s: failed mid-call", uid)
+            heard.append(f"xato: {type(e).__name__}")
+        finally:
+            await self._hangup(uid)
+            self._ended.pop(uid, None)
+            msg.unlink(missing_ok=True)
+        log.info("call %s: done, heard=%s frames=%d", uid, heard, self._frames_seen.get(uid, 0))
+        repeats = heard.count("yes")
+        last = heard[-1] if heard else ("siz qo'yib qo'ydingiz" if uid in self._gone else "")
+        note = {"no": "kerak emas dedingiz", "unclear": "javobingiz tushunilmadi",
+                "no_audio": "⚠️ ovozingiz eshitilmadi", "hung_up": "siz qo'yib qo'ydingiz"}.get(last, last)
+        return "gaplashildi" + (f", {repeats} marta qaytarildi" if repeats else "") + (f" · {note}" if note else "")

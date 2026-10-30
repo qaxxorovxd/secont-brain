@@ -80,6 +80,7 @@ class BrainBot:
         self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models)
         self.agent = Agent(cfg.tg_api_id, cfg.tg_api_hash, cfg.agent_phone, cfg.state_dir, self.ai)
         self.login_step: str | None = None  # phone | code | password
+        self._call_tasks: set[asyncio.Task] = set()
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():
@@ -292,8 +293,9 @@ class BrainBot:
             await q.message.reply_text("✖️ Bekor qilindi.")
             return
         if action == "test":
-            self.start_call(ctx, "Assalomu alaykum! Bu Brain yordamchingiz. Test qo'ng'iroq: hammasi ishlayapti")
-            await q.message.reply_text("📞 Qo'ng'iroq qilinyapti…")
+            ok = self.start_call(ctx, "Assalomu alaykum! Bu Brain yordamchingiz. Test qo'ng'iroq: hammasi ishlayapti")
+            await q.message.reply_text("📞 Qo'ng'iroq qilinyapti…" if ok
+                                       else "⏳ Qo'ng'iroq allaqachon ketyapti, tugashini kuting.")
             return
         if action == "toggle":
             self.agent.set_calls(not self.agent.calls_enabled)
@@ -381,9 +383,10 @@ class BrainBot:
         except Exception:
             pass
 
-    def start_call(self, ctx, text: str) -> None:
-        if not (self.agent.ready and self.owner_chat):
-            return
+    def start_call(self, ctx, text: str) -> bool:
+        """Queue a call in the background. At most one call waits behind the running one."""
+        if not (self.agent.ready and self.owner_chat) or self.agent.busy >= 2:
+            return False
 
         async def run():
             try:
@@ -391,13 +394,19 @@ class BrainBot:
             except Exception as e:
                 log.exception("call failed")
                 status = f"xatolik: {e}"
+            finally:
+                self.agent.busy -= 1
             if status == "owner_unknown":
                 await self.ask_contact(self.owner_chat, ctx)
                 return
             await self.send_md(self.owner_chat, ctx, f"📞 _Qo'ng'iroq: {status}_")
             self.brain.log(f"[call] {text}\n→ {status}", "call")
 
-        asyncio.create_task(run())
+        self.agent.busy += 1
+        task = asyncio.create_task(run())
+        self._call_tasks.add(task)  # keep a reference so the task isn't garbage-collected
+        task.add_done_callback(self._call_tasks.discard)
+        return True
 
     # ---------- jobs ----------
     def digest_text(self) -> str:
