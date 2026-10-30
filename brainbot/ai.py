@@ -1,9 +1,11 @@
 """Gemini brain: turns messages into tool calls on the Brain and short replies."""
 from __future__ import annotations
 
+import difflib
 import io
 import json
 import logging
+import re
 import time
 import wave
 from dataclasses import dataclass, field
@@ -60,6 +62,42 @@ LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for
 """
 
 
+UZ_ONES = ["nol", "bir", "ikki", "uch", "to'rt", "besh", "olti", "yetti", "sakkiz", "to'qqiz"]
+UZ_TENS = ["", "o'n", "yigirma", "o'ttiz", "qirq", "ellik", "oltmish", "yetmish", "sakson", "to'qson"]
+
+
+def uz_number(n: int) -> str:
+    if n < 10:
+        return UZ_ONES[n]
+    if n < 100:
+        return UZ_TENS[n // 10] + (f" {UZ_ONES[n % 10]}" if n % 10 else "")
+    return str(n)
+
+
+def _uz_time(m: re.Match) -> str:
+    h, mi = int(m.group(2)), int(m.group(3))
+    minutes = "" if not mi else f" nol {uz_number(mi)}" if mi < 10 else f" {uz_number(mi)}"
+    return f"{m.group(1)}{uz_number(h)}{minutes}"
+
+
+def speech_text(text: str) -> str:
+    """Make text safe and natural for TTS: no markdown/emoji, Uzbek clock times as words."""
+    text = re.sub(r"[*_`#~>|\[\]]", "", text)
+    text = re.sub(r"[\U00010000-\U0010FFFF☀-➿️‍]", "", text)
+    text = re.sub(r"\s*[—–·]\s*", ", ", text)
+    text = re.sub(r"(?i)\b(soat\s+)(\d{1,2})[:.](\d{2})\b", _uz_time, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _letters(text: str) -> str:
+    """Letters only, numbers spelled the same way on both sides — for comparing speech."""
+    text = re.sub(r"[ʻʼ’‘`´]", "'", text.lower())
+    text = re.sub(r"\b(\d{1,2}):(\d{2})\b", lambda m: uz_number(int(m.group(1))) + (
+        f" {uz_number(int(m.group(2)))}" if int(m.group(2)) else ""), text)
+    text = re.sub(r"\d+", lambda m: uz_number(int(m.group(0))), text)
+    return re.sub(r"[^a-z'а-яё]", "", text).replace("'", "")
+
+
 def pcm_to_wav(pcm: bytes, rate: int, channels: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -96,8 +134,8 @@ class Assistant:
         self.models = models
         self.history: list[types.Content] = []
         self.cooldown: dict[str, float] = {}
-        self.tts_models = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
-                           "gemini-3.8-flash-lite-tts", "gemini-2.5-flash-preview-tts"]
+        # gemini-2.5-flash-preview-tts is left out: it refuses plain text and misreads times
+        self.tts_models = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-3.8-flash-lite-tts"]
 
     # ---------- low-level ----------
     def _generate(self, contents, config: types.GenerateContentConfig):
@@ -133,8 +171,14 @@ class Assistant:
         )
         return (r.text or "").strip()
 
-    def tts(self, text: str) -> bytes:
-        """Text → WAV (24 kHz mono) with Gemini TTS."""
+    def tts(self, text: str, verify: bool = True) -> bytes:
+        """Text → WAV (24 kHz mono) with Gemini TTS.
+
+        Only the words to speak are sent — TTS models read any instruction aloud
+        (gemini-3.8-flash-lite-tts did exactly that). Each result is transcribed back and
+        rejected if it says something else; then the next model is tried."""
+        text = speech_text(text)
+        best: tuple[float, bytes] | None = None
         last: Exception | None = None
         for model in self.tts_models:
             if self.cooldown.get(model, 0) > time.time():
@@ -142,21 +186,45 @@ class Assistant:
             try:
                 r = self.client.models.generate_content(
                     model=model,
-                    contents=("Read this aloud in Uzbek (or English if the text is English), in a warm, "
-                              f"calm, clear voice, at a natural pace:\n{text}"),
+                    contents=text,
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")))),
                 )
-                pcm = r.candidates[0].content.parts[0].inline_data.data
-                return pcm_to_wav(pcm, 24000, 1)
+                wav = pcm_to_wav(r.candidates[0].content.parts[0].inline_data.data, 24000, 1)
             except Exception as e:
                 code = getattr(e, "code", 0)
                 self.cooldown[model] = time.time() + (86400 if code == 404 else 60)
                 log.warning("tts %s failed: %s", model, str(e)[:160])
                 last = e
-        raise RuntimeError(f"TTS ishlamadi: {str(last)[:200]}")
+                continue
+            if not verify:
+                return wav
+            score = self._spoken_score(wav, text)
+            log.info("tts %s: match %.2f", model, score)
+            if score >= 0.6:
+                return wav
+            if best is None or score > best[0]:
+                best = (score, wav)
+        if best and best[0] >= 0.35:  # every model was off a bit: use the closest one
+            return best[1]
+        raise RuntimeError(f"TTS ishlamadi: {str(last)[:200] if last else 'ovoz matnga mos kelmadi'}")
+
+    def _spoken_score(self, wav: bytes, text: str) -> float:
+        """How closely the audio says `text` (0..1). 1.0 when the check itself can't run."""
+        try:
+            heard = self.transcribe(wav, "audio/wav")
+        except Exception as e:
+            log.info("tts check skipped: %s", e)
+            return 1.0
+        want, got = _letters(text), _letters(heard)
+        log.info("tts check: heard %r", heard[:200])
+        if not want or not got:
+            return 0.0
+        if len(got) > 1.5 * len(want) + 15:  # extra speech, e.g. the model read an instruction
+            return 0.0
+        return difflib.SequenceMatcher(None, want, got).ratio()
 
     def yes_no(self, wav: bytes) -> str:
         """Did the person answer 'yes, repeat' to 'Qaytaraymi?' → yes | no | unclear."""

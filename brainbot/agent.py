@@ -316,9 +316,10 @@ class Agent:
         if not await self._owner_ready(uid):
             return "owner_unknown"
         msg = await self._audio(text.rstrip(".!?") + ". Qaytaraymi?", f"msg-{int(time.time())}")
-        bye = self.audio_dir / "bye.wav"
+        # v1 was made with the instruction-reading prompt; a full sentence is also read more reliably
+        bye = self.audio_dir / "bye-v2.wav"
         if not bye.exists():
-            bye = await self._audio("Xo'p. Omad!", "bye")
+            bye = await self._audio("Yaxshi, tushunarli. Omad tilayman!", "bye-v2")
         length = self._duration(msg)
         self._gone.discard(uid)
         self._frames_seen[uid] = 0
