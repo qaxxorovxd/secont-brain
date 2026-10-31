@@ -88,7 +88,6 @@ class BrainBot:
         self.ai.address_book = self.agent.book_names
         self.ai.reply_filter = self.agent.set_notify
         self.ai.tg = self.run_tg
-        self.agent.owner_id, self.agent.tz = self.owner_chat, cfg.tz
         self.loop: asyncio.AbstractEventLoop | None = None
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
@@ -96,6 +95,7 @@ class BrainBot:
             self.owner_chat = json.loads(self.owner_file.read_text())["chat_id"]
         elif len(cfg.allowed_ids) == 1:  # private chat id == user id, so reminders work before first message
             self.owner_chat = next(iter(cfg.allowed_ids))
+        self.agent.owner_id, self.agent.tz = self.owner_chat, cfg.tz
 
     # ---------- access ----------
     def _allowed(self, update: Update) -> bool:
