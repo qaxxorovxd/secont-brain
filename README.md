@@ -74,7 +74,8 @@ and asks *"Qaytaraymi?"* — say **"ha"** and it repeats (up to 3×).
 You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq qilib eslat"*.
 
 ### Contacting other people
-*"@ali_valiyev ga ayt, ertaga 10 da uchrashuv"* · *"+99890… ga yoz: kitobni olib kelaman"*
+*"@ali_valiyev ga qo'ng'iroq qil: …"* (📞 call) · *"opamga ovozli xabar tashla: …"* (🎙 voice note only) ·
+*"+99890… ga yoz: …"* (✉️ text only)
 
 1. Marin writes the message to that person (in the 3rd person: "Axmadjon aka … keladi").
 2. 🛡 **Privacy check** before anything is sent: secrets (tokens, keys, passwords) are always blocked;

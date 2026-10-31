@@ -410,7 +410,7 @@ class BrainBot:
                 if not check["ok"]:
                     await self.hold(ctx, o, check)
                     return
-            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["call"],
+            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["mode"],
                                          o.get("alias", ""))
         except Exception as e:
             log.exception("outreach failed")

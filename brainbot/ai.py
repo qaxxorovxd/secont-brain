@@ -89,8 +89,15 @@ Iltimos, bugun biroz ertaroq dam oling, charchagandirsiz. O'zingizni ehtiyot qil
 
 CONTACTING OTHER PEOPLE (via the agent account): "@ali ga ayt …", "+99890… ga qo'ng'iroq qil va …",
 "Sardorga yoz: …" → contact_person(target, message, call). target = the @username / phone / t.me link
-exactly as given (or the name of someone you reached before). call=false when the owner only says
-yoz / xabar yubor / write; otherwise (ayt, yetkaz, bog'lan, qo'ng'iroq qil, call) call=true.
+exactly as given (or the name of someone you reached before). mode = HOW janob wants it delivered:
+  "voice" — ovozli xabar / ovoz / audio / golosovoy / voice message → a voice note, NO call;
+  "text"  — yoz / xabar yoz / matn / sms / write → a text message, NO call;
+  "call"  — qo'ng'iroq qil / telefon qil / tel qil / call (or he just says ayt / yetkaz / bog'lan).
+Never call when he asked for a voice message or text.
+`message` is said BY YOU about him, so ALWAYS turn his first-person words into the 3rd person:
+  "kechqurun boraman" → to his mother: "O'g'lingiz Axmadjon kechqurun boradi."
+  "ertaga darsga boraman" → to a friend: "Axmadjon ertaga darsga boradi."
+  Never write "boraman / kelaman / men …" in `message`.
 `message` = what to tell THAT person: written by you, Marin, addressed to them politely ("siz"),
 in the language the owner wants (default Uzbek Latin), 1–4 sentences, conveying ONLY what janob asked.
 You speak FOR him, so talk about him in the 3rd person (to others: "Axmadjon aka ertaga kitobni olib
@@ -100,7 +107,7 @@ automatically. PRIVACY (strict): never put janob's personal data in `message` �
 location, schedule, tasks, notes, facts, health, money, passwords, accounts, server, other people's
 info — unless janob explicitly asked to share that exact item. Every message is privacy-checked before
 sending; if it is held, tell the owner briefly. Reply to the owner with one short line ("📨 Yuborilmoqda…").
-When a person's reply was forwarded and the owner says "unga javob yoz: …" → contact_person(call=false).
+When a person's reply was forwarded and the owner says "unga javob yoz: …" → contact_person(mode="text").
 NAMES & FAMILY: the owner may name someone instead of giving a number: "onam", "dadamga", "akamga",
 "Sardorga". Find them in ADDRESS BOOK — names may be in English/Russian (onam/oyim/ayam → "Mother"/"Mom"/
 "Мама"; dadam/otam → "Father"/"Dad"/"Папа"; akam → "Brother"…) — and pass that exact saved name as
@@ -110,7 +117,8 @@ When janob says what he calls the person ("bu kursdoshim Isroil", "onam"), pass 
 REPLY NOTIFICATIONS: people's replies to the agent are forwarded to janob by code, NOT by you, so a
 remember_rule alone cannot stop them. Any order about whose replies to notify / not notify
 ("X yozsa bildirishnoma yuborma", "faqat onam va opam yozsa eslat", "hammasini yubor") →
-reply_notifications (you may ALSO remember_rule). 🔕 in ADDRESS BOOK = muted. Muted replies are still in
+reply_notifications (you may ALSO remember_rule). 🔕 in ADDRESS BOOK = only HIS REPLIES are not
+forwarded; you can and must still contact that person when janob asks. Muted replies are still in
 the journal, so "Isroil nima yozdi?" → search_brain.
 Speak to family naturally: to his parents call him "o'g'lingiz Axmadjon", to siblings "ukangiz/akangiz
 Axmadjon" (as fits), not "Axmadjon aka".
@@ -222,7 +230,7 @@ class Reply:
     text: str
     files: list[dict] = field(default_factory=list)  # {"title","content","format"}
     calls: list[str] = field(default_factory=list)  # texts to speak in a phone call
-    outreach: list[dict] = field(default_factory=list)  # {"target","message","call","command"}
+    outreach: list[dict] = field(default_factory=list)  # {"target","message","mode","command","alias"}
 
 
 class Assistant:
@@ -544,14 +552,16 @@ class Assistant:
 
         outreach: list[dict] = []
 
-        def contact_person(target: str, message: str, call: bool = True, name: str = "") -> str:
+        def contact_person(target: str, message: str, mode: str = "call", name: str = "") -> str:
             """Reach ANOTHER person for the owner via the agent Telegram account: writes an intro,
-            phones them and speaks `message` (call=true), and sends it as text if the call fails.
+            mode: "call" (phone + speak; voice note if the call fails) | "voice" (voice note only) |
+            "text" (text message only).
             target: @username, +phone, t.me link, or the name of someone reached before.
             message: your polite words TO THAT PERSON with only what janob asked to convey; no greeting
             or intro (auto-added); never janob's private data unless he asked to share that exact item.
             name: what janob calls this person, if he said it ("Isroil", "onam", "kursdoshim Isroil" → "Isroil")."""
-            outreach.append({"target": target, "message": message.strip(), "call": bool(call),
+            mode = mode if mode in ("call", "voice", "text") else "call"
+            outreach.append({"target": target, "message": message.strip(), "mode": mode,
                              "command": text, "alias": name.strip()})
             return "queued: privacy check, then send"
 

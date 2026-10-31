@@ -574,7 +574,7 @@ class Agent:
         return {"mode": "faqat ro'yxatdagilar" if f["mode"] == "only" else "hammasi (jimlardan tashqari)",
                 "changed": [p["name"] for p in found], "not_found": unknown}
 
-    async def reach(self, target: str, intro: str, message: str, call: bool, alias: str = "") -> dict:
+    async def reach(self, target: str, intro: str, message: str, mode: str = "call", alias: str = "") -> dict:
         """Write `intro` to the person, phone them and speak intro+message; if the call does not
         go through, send it as a voice note (text if that fails). Returns {"who", "steps"}."""
         if not self.ready:
@@ -587,9 +587,14 @@ class Agent:
         contact = self._remember(user, target, alias)
         who = contact["name"] + (f" (@{contact['username']})" if contact["username"] else "")
         steps: list[str] = []
-        if not call:
+        if mode == "text":
             await self.client.send_message(user, f"{intro}\n\n{message}")
             return {"who": who, "steps": ["✉️ xabar yozildi"], "contact": contact}
+        if mode == "voice":
+            if await self.send_voice(user, f"{intro} {message}"):
+                return {"who": who, "steps": ["🎙 ovozli xabar yuborildi"], "contact": contact}
+            await self.client.send_message(user, f"{intro}\n\n{message}")
+            return {"who": who, "steps": ["⚠️ ovoz yaratilmadi", "✉️ matn qilib yozildi"], "contact": contact}
         await self.client.send_message(user, intro + "\nHozir sizga qo'ng'iroq qilib, xabarni aytib beraman.")
         steps.append("✉️ tanishtiruv yozildi")
         try:
