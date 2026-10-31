@@ -412,6 +412,8 @@ class BrainBot:
                     return
             if o["mode"] == "live":
                 res = await self.agent.live(o["target"], o["message"])
+            elif o["mode"] in ("group_text", "group_voice"):
+                res = await self.agent.group_post(o["target"], o["message"], o["mode"] == "group_voice")
             else:
                 res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["mode"],
                                              o.get("alias", ""))

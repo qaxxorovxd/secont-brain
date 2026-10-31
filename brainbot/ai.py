@@ -114,6 +114,9 @@ NAMES & FAMILY: the owner may name someone instead of giving a number: "onam", "
 target. If unsure, pass the owner's word as said ("onam"): the agent also matches family words itself.
 NEVER tell the owner someone is not found without calling contact_person first — it reports if not found.
 When janob says what he calls the person ("bu kursdoshim Isroil", "onam"), pass it as `name`.
+GROUP MESSAGE: "<guruh> ga yoz: …", "<guruh> guruhiga ovozli xabar tashla: …" → post_to_group(group, message,
+voice). A group is not a person: use post_to_group, not contact_person. `message` = janob's OWN words as
+written (no 3rd person, no intro). Privacy check applies.
 GROUP LIVE: "<guruh> jonli efiriga / ovozli chatiga kir va … de", "<guruh> efirida ayt: …" → speak_in_live(group,
 message). Here `message` is janob's OWN words said as written (no 3rd person, no intro). The agent joins,
 waits 3 s, speaks, leaves, and reports. Privacy check applies.
@@ -123,8 +126,10 @@ remember_rule alone cannot stop them. Any order about whose replies to notify / 
 reply_notifications (you may ALSO remember_rule). 🔕 in ADDRESS BOOK = only HIS REPLIES are not
 forwarded; you can and must still contact that person when janob asks. Muted replies are still in
 the journal, so "Isroil nima yozdi?" → search_brain.
-Speak to family naturally: to his parents call him "o'g'lingiz Axmadjon", to siblings "ukangiz/akangiz
-Axmadjon" (as fits), not "Axmadjon aka".
+Speak to family by how they are related TO HIM (he is their son / younger or older brother):
+  onam, dadam → "o'g'lingiz Axmadjon";  opam, akam (older) → "ukangiz Axmadjon";
+  singlim, ukam (younger) → "akangiz Axmadjon";  others → "Axmadjon aka" / "Axmadjon".
+  Never say "o'g'lingiz" to a sister or brother.
 
 LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for a file / txt / pdf /
 "to'liq" export, call send_file with the full well-formatted Markdown content and reply with one short line.
@@ -568,6 +573,15 @@ class Assistant:
                              "command": text, "alias": name.strip()})
             return "queued: privacy check, then send"
 
+        def post_to_group(group: str, message: str, voice: bool = False) -> str:
+            """Write a message in a GROUP / channel chat with the agent account (not a live voice chat).
+            group: the group's title as janob wrote it (or @username / link).
+            message: janob's words as he wrote them (fix spelling only). voice=true when he asks for an
+            ovozli xabar / voice message."""
+            outreach.append({"target": group, "message": message.strip(),
+                             "mode": "group_voice" if voice else "group_text", "command": text, "alias": ""})
+            return "queued: privacy check, then post"
+
         def speak_in_live(group: str, message: str) -> str:
             """Join a group's LIVE voice chat / jonli efir with the agent account, wait 3 seconds, say
             `message` aloud, then leave. group: the group's title as janob wrote it (or @username / link).
@@ -604,7 +618,7 @@ class Assistant:
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
                  remember_fact, update_fact, remember_rule, forget_rule,
                  save_note, update_note, read_note, search_brain, web_search, update_profile,
-                 send_file, phone_call, contact_person, reply_notifications, speak_in_live]
+                 send_file, phone_call, contact_person, reply_notifications, speak_in_live, post_to_group]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(

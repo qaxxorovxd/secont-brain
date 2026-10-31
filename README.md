@@ -89,6 +89,10 @@ You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq 
 4. Their replies to the agent (text or voice → transcribed) are forwarded to you. Marin never chats with
    them on her own; say *"unga javob yoz: …"*.
 
+### Writing in a group
+*"TATU 2-kurs guruhiga yoz: ertaga dars yo'q"* · *"Oila guruhiga ovozli xabar tashla: …"* → the agent posts
+your words (text or a voice note in Marin's voice) in that group; it must be a member allowed to write.
+
 ### Speaking in a group live (voice chat)
 *"TATU 2-kurs jonli efiriga kir va 'bugun dars soat 2 da' de"* → the agent finds the group by title
 (it must be a member), checks that a live voice chat is on, joins, waits 3 s, says your words in Marin's

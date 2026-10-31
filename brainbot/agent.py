@@ -642,6 +642,31 @@ class Agent:
             i = max(hits, key=lambda k: len(titles[k])) if hits else -1
         return groups[i].entity if i >= 0 else None
 
+    async def group_post(self, group: str, text: str, voice: bool = False) -> dict:
+        """Write `text` (or say it as a voice note) in a group/channel the agent is in."""
+        if not self.ready:
+            return {"who": group, "steps": ["⚠️ agent ulanmagan (/agent)"]}
+        ent = await self.find_group(group)
+        if not ent:
+            return {"who": group, "steps": ["⚠️ guruh topilmadi — agent a'zo bo'lgan guruh nomini yozing"]}
+        who = f"{getattr(ent, 'title', group)} (guruh)"
+        if self._count_today() > DAILY_OUTREACH_LIMIT:
+            return {"who": who, "steps": [f"⚠️ kunlik limit ({DAILY_OUTREACH_LIMIT} ta) tugadi"]}
+        steps: list[str] = []
+        try:
+            if voice:
+                if await self.send_voice(ent, text):
+                    return {"who": who, "steps": ["🎙 ovozli xabar yuborildi"]}
+                steps.append("⚠️ ovoz yaratilmadi (Gemini limiti bo'lishi mumkin)")
+            await self.client.send_message(ent, text)
+            steps.append("✉️ xabar yozildi" + (" (matn qilib)" if voice else ""))
+        except Exception as e:
+            log.warning("group post %s failed: %s", group, e)
+            why = ("guruhda yozishga ruxsat yo'q" if "Forbidden" in type(e).__name__ or "WRITE" in str(e)
+                   else type(e).__name__)
+            steps.append(f"⚠️ yuborib bo'lmadi: {why}")
+        return {"who": who, "steps": steps}
+
     async def _live_now(self, ent) -> bool:
         if isinstance(ent, tl.Channel):
             full = await self.client(functions.channels.GetFullChannelRequest(ent))
