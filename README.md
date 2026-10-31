@@ -89,6 +89,12 @@ You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq 
 4. Their replies to the agent (text or voice → transcribed) are forwarded to you. Marin never chats with
    them on her own; say *"unga javob yoz: …"*.
 
+### Speaking in a group live (voice chat)
+*"TATU 2-kurs jonli efiriga kir va 'bugun dars soat 2 da' de"* → the agent finds the group by title
+(it must be a member), checks that a live voice chat is on, joins, waits 3 s, says your words in Marin's
+voice and leaves. The report says if there was no live, if an admin muted the agent, or if it was removed.
+Your words go through the same privacy check.
+
 Plain names only match people Marin reached before (never a random public @username). Max 30 per day.
 Reached people are kept in `.state/contacts.json`.
 The session is stored in `.state/agent.json` (never in git). Server needs `ffmpeg`.

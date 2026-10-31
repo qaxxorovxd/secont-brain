@@ -114,6 +114,9 @@ NAMES & FAMILY: the owner may name someone instead of giving a number: "onam", "
 target. If unsure, pass the owner's word as said ("onam"): the agent also matches family words itself.
 NEVER tell the owner someone is not found without calling contact_person first — it reports if not found.
 When janob says what he calls the person ("bu kursdoshim Isroil", "onam"), pass it as `name`.
+GROUP LIVE: "<guruh> jonli efiriga / ovozli chatiga kir va … de", "<guruh> efirida ayt: …" → speak_in_live(group,
+message). Here `message` is janob's OWN words said as written (no 3rd person, no intro). The agent joins,
+waits 3 s, speaks, leaves, and reports. Privacy check applies.
 REPLY NOTIFICATIONS: people's replies to the agent are forwarded to janob by code, NOT by you, so a
 remember_rule alone cannot stop them. Any order about whose replies to notify / not notify
 ("X yozsa bildirishnoma yuborma", "faqat onam va opam yozsa eslat", "hammasini yubor") →
@@ -565,6 +568,14 @@ class Assistant:
                              "command": text, "alias": name.strip()})
             return "queued: privacy check, then send"
 
+        def speak_in_live(group: str, message: str) -> str:
+            """Join a group's LIVE voice chat / jonli efir with the agent account, wait 3 seconds, say
+            `message` aloud, then leave. group: the group's title as janob wrote it (or @username / link).
+            message: janob's words to say, as he wrote them (fix spelling only)."""
+            outreach.append({"target": group, "message": message.strip(), "mode": "live",
+                             "command": text, "alias": ""})
+            return "queued: privacy check, then join the live"
+
         def reply_notifications(people: str = "", notify: bool = True, only_these: bool = False) -> dict:
             """Control which forwarded replies (from people you reached) the owner gets notified about.
             Enforced by code. people: comma-separated names / aliases / @usernames / family words.
@@ -593,7 +604,7 @@ class Assistant:
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
                  remember_fact, update_fact, remember_rule, forget_rule,
                  save_note, update_note, read_note, search_brain, web_search, update_profile,
-                 send_file, phone_call, contact_person, reply_notifications]
+                 send_file, phone_call, contact_person, reply_notifications, speak_in_live]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(

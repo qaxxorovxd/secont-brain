@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import io
 import shutil
 import time
 import unicodedata
@@ -23,7 +24,7 @@ from .ai import pcm_to_wav
 log = logging.getLogger(__name__)
 
 try:  # optional: the bot still works without call support
-    from telethon import TelegramClient, events, functions, types as tl
+    from telethon import TelegramClient, events, functions, types as tl, utils as tlutils
     from telethon.errors import SessionPasswordNeededError
     from telethon.sessions import StringSession
     from pytgcalls import PyTgCalls, filters as fl
@@ -612,6 +613,110 @@ class Agent:
                     user, f"Qo'ng'iroq qila olmadim, shuning uchun xabarni yozib qoldiraman:\n\n{message}")
                 steps.append("✉️ xabar matn qilib yuborildi")
         return {"who": who, "steps": steps, "contact": contact}
+
+    # ---------- group live (voice chat / live stream) ----------
+    async def find_group(self, name: str):
+        """A group/channel the agent is in, by title (or @username / t.me link)."""
+        m = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{4,32})", name)
+        if m:
+            try:
+                return await self.client.get_entity(m.group(1))
+            except Exception as e:
+                log.info("group %s not found: %s", name, e)
+                return None
+        groups = [d async for d in self.client.iter_dialogs(limit=500) if d.is_group or d.is_channel]
+        titles = [_low(d.name) for d in groups]
+        # "TATU 2-kurs guruhi" / "Dasturchilar chatidagi" → drop the generic word
+        q = re.sub(r"\b(guruh|gruppa|group|chat|kanal|channel|efir)\w*", " ", _low(name))
+        q = re.sub(r"\s+", " ", q).strip(" '\"")
+        for cand in (_low(name), q):
+            if cand in titles:
+                return groups[titles.index(cand)].entity
+        i = match_name(q or name, [d.name for d in groups])
+        if i < 0 and q:  # every word of the query starts a word of the title ("IT Park" → "IT Park Uzbekistan")
+            words = q.split()
+            hits = [k for k, t in enumerate(titles) if all(any(w2.startswith(w) for w2 in t.split()) for w in words)]
+            i = hits[0] if len(hits) == 1 else -1
+        if i < 0:  # a title written inside a longer phrase; longest title wins
+            hits = [k for k, t in enumerate(titles) if len(t) >= 4 and t in _low(name)]
+            i = max(hits, key=lambda k: len(titles[k])) if hits else -1
+        return groups[i].entity if i >= 0 else None
+
+    async def _live_now(self, ent) -> bool:
+        if isinstance(ent, tl.Channel):
+            full = await self.client(functions.channels.GetFullChannelRequest(ent))
+        else:
+            full = await self.client(functions.messages.GetFullChatRequest(ent.id))
+        return getattr(full.full_chat, "call", None) is not None
+
+    @staticmethod
+    def _with_silence(wav: bytes, seconds: float) -> bytes:
+        """Prepend `seconds` of silence to a WAV (so the speech starts after joining)."""
+        with wave.open(io.BytesIO(wav)) as w:
+            params, frames = w.getparams(), w.readframes(w.getnframes())
+        pad = b"\x00" * int(params.framerate * seconds) * params.sampwidth * params.nchannels
+        out = io.BytesIO()
+        with wave.open(out, "wb") as w:
+            w.setparams(params)
+            w.writeframes(pad + frames)
+        return out.getvalue()
+
+    async def live(self, group: str, text: str, delay: float = 3.0) -> dict:
+        """Join the group's live voice chat, wait `delay` s, say `text`, leave. Returns {who, steps}."""
+        if not self.ready:
+            return {"who": group, "steps": ["⚠️ agent ulanmagan (/agent)"]}
+        ent = await self.find_group(group)
+        if not ent:
+            return {"who": group, "steps": ["⚠️ guruh topilmadi — agent a'zo bo'lgan guruh nomini yozing"]}
+        title = getattr(ent, "title", group)
+        try:
+            if not await self._live_now(ent):
+                return {"who": title, "steps": ["📴 hozir jonli efir yo'q"]}
+        except Exception as e:
+            log.info("live check %s: %s", title, e)
+        cid = tlutils.get_peer_id(ent)
+        async with self.lock:
+            try:
+                steps = await asyncio.wait_for(self._live(cid, text, delay), timeout=180)
+            except asyncio.TimeoutError:
+                await self._hangup(cid)
+                steps = ["⚠️ vaqt tugadi, chiqib ketdi"]
+        return {"who": f"{title} (jonli efir)", "steps": steps}
+
+    async def _live(self, cid: int, text: str, delay: float) -> list[str]:
+        path = self.audio_dir / f"live-{int(time.time() * 1000)}.wav"
+        try:
+            wav = await asyncio.to_thread(self.ai.tts, text)
+        except Exception as e:
+            return [f"⚠️ ovoz yaratilmadi ({str(e)[:80]})"]
+        path.write_bytes(self._with_silence(wav, delay))
+        length = self._duration(path)
+        self._gone.discard(cid)
+        fut = self._ended[cid] = asyncio.get_running_loop().create_future()
+        steps: list[str] = []
+        try:
+            try:
+                await asyncio.wait_for(self.calls.play(cid, self._stream(path)), timeout=30)
+            except Exception as e:
+                log.warning("live %s: join failed: %s", cid, e)
+                return [f"⚠️ efirga qo'shilib bo'lmadi ({type(e).__name__})"]
+            steps.append("🎧 efirga qo'shildi")
+            try:  # best effort: is the agent allowed to speak?
+                me = (await self.client.get_me()).id
+                for p in await self.calls.get_participants(cid):
+                    if p.user_id == me and p.muted_by_admin:
+                        steps.append("⚠️ admin ovozni o'chirgan — eshitilmagan bo'lishi mumkin")
+            except Exception:
+                pass
+            finished = await self._wait_end(cid, fut, length)
+            steps.append(f"🗣 {delay:g} soniyadan so'ng gap aytildi" if finished
+                         else "⚠️ efirdan chiqarib yuborildi")
+        finally:
+            await self._hangup(cid)
+            self._ended.pop(cid, None)
+            path.unlink(missing_ok=True)
+        steps.append("👋 chiqib ketdi")
+        return steps
 
     async def send_voice(self, user, text: str, caption: str = "") -> bool:
         """Speak `text` with Marin's voice and send it as a Telegram voice note. False if it fails."""

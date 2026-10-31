@@ -410,8 +410,11 @@ class BrainBot:
                 if not check["ok"]:
                     await self.hold(ctx, o, check)
                     return
-            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["mode"],
-                                         o.get("alias", ""))
+            if o["mode"] == "live":
+                res = await self.agent.live(o["target"], o["message"])
+            else:
+                res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["mode"],
+                                             o.get("alias", ""))
         except Exception as e:
             log.exception("outreach failed")
             res = {"who": o["target"], "steps": [f"⚠️ xatolik: {str(e)[:150]}"]}
