@@ -106,6 +106,12 @@ NAMES & FAMILY: the owner may name someone instead of giving a number: "onam", "
 "Мама"; dadam/otam → "Father"/"Dad"/"Папа"; akam → "Brother"…) — and pass that exact saved name as
 target. If unsure, pass the owner's word as said ("onam"): the agent also matches family words itself.
 NEVER tell the owner someone is not found without calling contact_person first — it reports if not found.
+When janob says what he calls the person ("bu kursdoshim Isroil", "onam"), pass it as `name`.
+REPLY NOTIFICATIONS: people's replies to the agent are forwarded to janob by code, NOT by you, so a
+remember_rule alone cannot stop them. Any order about whose replies to notify / not notify
+("X yozsa bildirishnoma yuborma", "faqat onam va opam yozsa eslat", "hammasini yubor") →
+reply_notifications (you may ALSO remember_rule). 🔕 in ADDRESS BOOK = muted. Muted replies are still in
+the journal, so "Isroil nima yozdi?" → search_brain.
 Speak to family naturally: to his parents call him "o'g'lingiz Axmadjon", to siblings "ukangiz/akangiz
 Axmadjon" (as fits), not "Axmadjon aka".
 
@@ -225,6 +231,7 @@ class Assistant:
         self.brain = brain
         self._owner_name = owner_name
         self.address_book = lambda: []  # names Marin can reach (set by the bot from the agent)
+        self.reply_filter = lambda names, on, only: {"error": "agent not linked"}  # set by the bot
         self.voice = voice
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
             timeout=45_000, retry_options=types.HttpRetryOptions(attempts=1)))
@@ -537,14 +544,26 @@ class Assistant:
 
         outreach: list[dict] = []
 
-        def contact_person(target: str, message: str, call: bool = True) -> str:
+        def contact_person(target: str, message: str, call: bool = True, name: str = "") -> str:
             """Reach ANOTHER person for the owner via the agent Telegram account: writes an intro,
             phones them and speaks `message` (call=true), and sends it as text if the call fails.
             target: @username, +phone, t.me link, or the name of someone reached before.
             message: your polite words TO THAT PERSON with only what janob asked to convey; no greeting
-            or intro (auto-added); never janob's private data unless he asked to share that exact item."""
-            outreach.append({"target": target, "message": message.strip(), "call": bool(call), "command": text})
+            or intro (auto-added); never janob's private data unless he asked to share that exact item.
+            name: what janob calls this person, if he said it ("Isroil", "onam", "kursdoshim Isroil" → "Isroil")."""
+            outreach.append({"target": target, "message": message.strip(), "call": bool(call),
+                             "command": text, "alias": name.strip()})
             return "queued: privacy check, then send"
+
+        def reply_notifications(people: str = "", notify: bool = True, only_these: bool = False) -> dict:
+            """Control which forwarded replies (from people you reached) the owner gets notified about.
+            Enforced by code. people: comma-separated names / aliases / @usernames / family words.
+            "X yozsa bildirishnoma yuborma" → people="X", notify=false.
+            "faqat onam va opam yozsa eslat" → people="onam, opam", notify=true, only_these=true.
+            "hammasini yubor / filtrni o'chir" → people="", notify=true, only_these=false.
+            Muted replies are still saved in the journal."""
+            names = [x for x in re.split(r",|\bva\b|\band\b", people) if x.strip()]
+            return self.reply_filter(names, bool(notify), bool(only_these))
 
         phone_calls: list[str] = []
 
@@ -564,7 +583,7 @@ class Assistant:
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
                  remember_fact, update_fact, remember_rule, forget_rule,
                  save_note, update_note, read_note, search_brain, web_search, update_profile,
-                 send_file, phone_call, contact_person]
+                 send_file, phone_call, contact_person, reply_notifications]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(

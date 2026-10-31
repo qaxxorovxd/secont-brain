@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 import wave
 from pathlib import Path
 
@@ -54,7 +55,7 @@ RELATIONS = {
 
 
 def _low(s: str) -> str:
-    return (s or "").lower().replace("‘", "'").replace("’", "'").replace("ʻ", "'").strip()
+    return unicodedata.normalize("NFKC", s or "").lower().replace("‘", "'").replace("’", "'").replace("ʻ", "'").strip()
 
 
 def match_name(query: str, names: list[str]) -> int:
@@ -435,11 +436,14 @@ class Agent:
         except OSError:
             pass
 
-    def _remember(self, user, via: str) -> dict:
+    def _remember(self, user, via: str, alias: str = "") -> dict:
         data = self.contacts()
         name = " ".join(x for x in (user.first_name, user.last_name) if x) or via
+        aliases = data.get(str(user.id), {}).get("alias", [])
+        if alias and alias not in aliases:
+            aliases = aliases + [alias]
         c = {"id": user.id, "hash": user.access_hash, "name": name,
-             "username": user.username or "", "phone": user.phone or "", "via": via}
+             "username": user.username or "", "phone": user.phone or "", "via": via, "alias": aliases}
         data[str(user.id)] = c
         self._save_contacts(data)
         return c
@@ -503,12 +507,74 @@ class Agent:
             log.warning("contacts load failed: %s", e)
 
     def book_names(self) -> list[str]:
-        """Names only (no phone numbers) for Marin's context."""
-        names = [self._name(u) for u in self.book]
-        names += [cc["name"] for cc in self.contacts().values() if cc["name"] not in names]
-        return [n for n in names if n][:200]
+        """Names only (no phone numbers) for Marin's context, with the owner's aliases and 🔕 for muted."""
+        reached = self.contacts()
+        out, seen = [], set()
+        for u in self.book:
+            cc = reached.get(str(u.id))
+            out.append(self._label(cc) if cc else self._name(u))
+            seen.add(str(u.id))
+        out += [self._label(cc) for k, cc in reached.items() if k not in seen]
+        return [n for n in out if n][:200]
 
-    async def reach(self, target: str, intro: str, message: str, call: bool) -> dict:
+    def _label(self, cc: dict) -> str:
+        s = cc["name"]
+        if cc.get("username"):
+            s += f" @{cc['username']}"
+        if cc.get("alias"):
+            s += f" (janob: {', '.join(cc['alias'])})"
+        return s + ("" if self.notify_allowed(cc["id"]) else " 🔕")
+
+    # ---------- which replies reach the owner ----------
+    def _filter(self) -> dict:
+        f = self._load().get("reply_filter") or {}
+        return {"mode": f.get("mode", "all"), "allow": f.get("allow", []), "mute": f.get("mute", [])}
+
+    def notify_allowed(self, uid: int) -> bool:
+        f = self._filter()
+        if f["mode"] == "only":
+            return uid in f["allow"]
+        return uid not in f["mute"]
+
+    def find_people(self, names: list[str]) -> tuple[list[dict], list[str]]:
+        """Match names / aliases / @usernames / family words to known people → (found, unknown)."""
+        people = {str(u.id): {"id": u.id, "name": self._name(u), "username": u.username or "", "alias": []}
+                  for u in self.book}
+        people.update(self.contacts())
+        plist = list(people.values())
+        keys = [" ".join([p["name"], p.get("username", "")] + p.get("alias", [])) for p in plist]
+        found, unknown = [], []
+        for n in names:
+            n = n.strip()
+            if not n:
+                continue
+            i = match_name(n, keys)
+            if i < 0:  # alias given as a whole phrase, e.g. "opam" saved as alias
+                i = next((k for k, p in enumerate(plist) if _low(n) in [_low(a) for a in p.get("alias", [])]), -1)
+            (found.append(plist[i]) if i >= 0 else unknown.append(n))
+        return found, unknown
+
+    def set_notify(self, names: list[str], on: bool, only: bool = False) -> dict:
+        """on=False: mute these people. on=True: unmute; with only=True: notify ONLY these.
+        names empty + on + not only: back to "everyone"."""
+        f = self._filter()
+        found, unknown = self.find_people(names)
+        ids = [p["id"] for p in found]
+        if not names and on and not only:
+            f = {"mode": "all", "allow": [], "mute": []}
+        elif only:
+            f = {"mode": "only", "allow": ids, "mute": []}
+        elif on:
+            f["mute"] = [x for x in f["mute"] if x not in ids]
+            f["allow"] = sorted(set(f["allow"]) | set(ids))
+        else:
+            f["mute"] = sorted(set(f["mute"]) | set(ids))
+            f["allow"] = [x for x in f["allow"] if x not in ids]
+        self._save(reply_filter=f)
+        return {"mode": "faqat ro'yxatdagilar" if f["mode"] == "only" else "hammasi (jimlardan tashqari)",
+                "changed": [p["name"] for p in found], "not_found": unknown}
+
+    async def reach(self, target: str, intro: str, message: str, call: bool, alias: str = "") -> dict:
         """Write `intro` to the person, phone them and speak intro+message; if the call does not
         go through, send it as a voice note (text if that fails). Returns {"who", "steps"}."""
         if not self.ready:
@@ -518,7 +584,7 @@ class Agent:
         user = await self.resolve(target)
         if not user:
             return {"who": target, "steps": ["⚠️ Telegramda topilmadi (username yoki raqamni tekshiring)"]}
-        contact = self._remember(user, target)
+        contact = self._remember(user, target, alias)
         who = contact["name"] + (f" (@{contact['username']})" if contact["username"] else "")
         steps: list[str] = []
         if not call:
@@ -580,4 +646,4 @@ class Agent:
         elif ev.media and not text:
             text = "📎 (fayl yoki rasm yubordi)"
         if text:
-            await self.on_reply(c, text)
+            await self.on_reply(c, text, self.notify_allowed(c["id"]))

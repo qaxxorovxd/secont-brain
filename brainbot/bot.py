@@ -86,6 +86,7 @@ class BrainBot:
         self.app: Application | None = None
         self.agent.on_reply = self.on_person_reply
         self.ai.address_book = self.agent.book_names
+        self.ai.reply_filter = self.agent.set_notify
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():
@@ -409,7 +410,8 @@ class BrainBot:
                 if not check["ok"]:
                     await self.hold(ctx, o, check)
                     return
-            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["call"])
+            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["call"],
+                                         o.get("alias", ""))
         except Exception as e:
             log.exception("outreach failed")
             res = {"who": o["target"], "steps": [f"⚠️ xatolik: {str(e)[:150]}"]}
@@ -446,16 +448,25 @@ class BrainBot:
         else:
             await self.send_md(self.owner_chat, ctx, "❌ _Bekor qilindi._")
 
-    async def on_person_reply(self, contact: dict, text: str) -> None:
-        """Someone Marin reached wrote back to the agent account → tell the owner."""
-        who = contact["name"] + (f" (@{contact['username']})" if contact["username"] else "")
-        self.brain.log(f"[reply] {who}: {text}", "reply")
-        if self.owner_chat and self.app:
-            md = f"💬 **{who}** javob yozdi:\n{text}"
+    async def on_person_reply(self, contact: dict, text: str, notify: bool = True) -> None:
+        """Someone Marin reached wrote back to the agent account → journal always, owner only if allowed."""
+        alias = ", ".join(contact.get("alias") or [])
+        who = (f"{alias} — " if alias else "") + contact["name"] + (
+            f" (@{contact['username']})" if contact["username"] else "")
+        self.brain.log(f"[reply{'' if notify else ' 🔕'}] {who}: {text}", "reply")
+        if not (notify and self.owner_chat and self.app):
+            return
+        md = f"💬 **{who}** javob yozdi:\n{text}"
+        for attempt in range(3):  # the Bot API connection can drop for a moment
             try:
-                await self.app.bot.send_message(self.owner_chat, md_to_html(md), parse_mode=ParseMode.HTML)
-            except BadRequest:
-                await self.app.bot.send_message(self.owner_chat, md)
+                try:
+                    await self.app.bot.send_message(self.owner_chat, md_to_html(md), parse_mode=ParseMode.HTML)
+                except BadRequest:
+                    await self.app.bot.send_message(self.owner_chat, md)
+                return
+            except Exception as e:
+                log.warning("reply forward attempt %d failed: %s", attempt + 1, e)
+                await asyncio.sleep(3)
 
     def start_call(self, ctx, text: str) -> bool:
         """Queue a call in the background. At most one call waits behind the running one."""
