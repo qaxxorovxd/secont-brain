@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, time as dtime, timedelta
 from functools import wraps
 
@@ -77,10 +78,13 @@ class BrainBot:
         self.brain = Brain(cfg.brain_dir, cfg.tz)
         self.git = GitSync(cfg.brain_dir, cfg.git_sync, self.brain.lock)
         self.brain.on_change = self.git.mark_dirty
-        self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models, cfg.tts_voice)
+        self.ai = Assistant(self.brain, cfg.gemini_key, cfg.models, cfg.tts_voice, cfg.owner_name)
         self.agent = Agent(cfg.tg_api_id, cfg.tg_api_hash, cfg.agent_phone, cfg.state_dir, self.ai)
         self.login_step: str | None = None  # phone | code | password
         self._call_tasks: set[asyncio.Task] = set()
+        self._held: dict[str, dict] = {}  # outreach waiting for the owner's approval
+        self.app: Application | None = None
+        self.agent.on_reply = self.on_person_reply
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():
@@ -144,6 +148,8 @@ class BrainBot:
                 await ctx.bot.send_document(chat, fh, filename=p.name, caption=f"📎 {f['title']}")
         for text in reply.calls:
             self.start_call(ctx, text)
+        for o in reply.outreach:
+            self._background(self.outreach(ctx, o))
         if self.git.dirty:
             asyncio.create_task(asyncio.to_thread(self.git.push))
 
@@ -384,6 +390,72 @@ class BrainBot:
         except Exception:
             pass
 
+    def _background(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._call_tasks.add(task)  # keep a reference so the task isn't garbage-collected
+        task.add_done_callback(self._call_tasks.discard)
+
+    # ---------- reaching other people ----------
+    async def outreach(self, ctx, o: dict, approved: bool = False) -> None:
+        """Privacy-check, then message/call the person. Held messages wait for the owner's button."""
+        chat = self.owner_chat
+        try:
+            if not self.agent.ready:
+                await self.send_md(chat, ctx, "⚠️ Agent hisobi ulanmagan — /agent orqali ulang.")
+                return
+            if not approved:
+                check = await asyncio.to_thread(self.ai.privacy_check, o["command"], o["message"])
+                if not check["ok"]:
+                    await self.hold(ctx, o, check)
+                    return
+            res = await self.agent.reach(o["target"], self.ai.intro(), o["message"], o["call"])
+        except Exception as e:
+            log.exception("outreach failed")
+            res = {"who": o["target"], "steps": [f"⚠️ xatolik: {str(e)[:150]}"]}
+        await self.send_md(chat, ctx, f"📨 **{res['who']}**\n" + "\n".join(f"- {s}" for s in res["steps"]))
+        self.brain.log(f"[outreach] {res['who']}: {o['message']}\n→ {'; '.join(res['steps'])}", "outreach")
+        if self.git.dirty:
+            await asyncio.to_thread(self.git.push)
+
+    async def hold(self, ctx, o: dict, check: dict) -> None:
+        key = f"{int(time.time() * 1000) % 10**9}"
+        self._held[key] = o
+        why = "\n".join(f"- {r}" for r in check["reasons"])
+        text = (f"🛡 **Xabar to'xtatildi** — {o['target']}\n{why}\n\n_Yubormoqchi bo'lgan matnim:_\n{o['message']}")
+        buttons = [Btn("❌ Bekor qilish", callback_data=f"ox:no:{key}")]
+        if not check["hard"]:
+            buttons.insert(0, Btn("✅ Baribir yuborish", callback_data=f"ox:yes:{key}"))
+        else:
+            text += "\n\n⛔ Maxfiy kalit/parol bor — bunday xabar yuborilmaydi."
+        await ctx.bot.send_message(self.owner_chat, md_to_html(text), parse_mode=ParseMode.HTML,
+                                   reply_markup=InlineKeyboardMarkup([buttons]))
+
+    @guarded
+    async def on_outreach_button(self, update: Update, ctx):
+        q = update.callback_query
+        _, action, key = q.data.split(":", 2)
+        o = self._held.pop(key, None)
+        await q.answer()
+        await q.edit_message_reply_markup(None)
+        if not o:
+            await self.send_md(self.owner_chat, ctx, "_Bu so'rov eskirgan._")
+        elif action == "yes":
+            await self.send_md(self.owner_chat, ctx, "📨 _Yuborilmoqda…_")
+            self._background(self.outreach(ctx, o, approved=True))
+        else:
+            await self.send_md(self.owner_chat, ctx, "❌ _Bekor qilindi._")
+
+    async def on_person_reply(self, contact: dict, text: str) -> None:
+        """Someone Marin reached wrote back to the agent account → tell the owner."""
+        who = contact["name"] + (f" (@{contact['username']})" if contact["username"] else "")
+        self.brain.log(f"[reply] {who}: {text}", "reply")
+        if self.owner_chat and self.app:
+            md = f"💬 **{who}** javob yozdi:\n{text}"
+            try:
+                await self.app.bot.send_message(self.owner_chat, md_to_html(md), parse_mode=ParseMode.HTML)
+            except BadRequest:
+                await self.app.bot.send_message(self.owner_chat, md)
+
     def start_call(self, ctx, text: str) -> bool:
         """Queue a call in the background. At most one call waits behind the running one."""
         if not (self.agent.ready and self.owner_chat) or self.agent.busy >= 2:
@@ -456,6 +528,7 @@ class BrainBot:
         await asyncio.to_thread(self.git.pull)
 
     async def post_init(self, app: Application):
+        self.app = app
         await self.agent.start()
         await app.bot.set_my_commands([
             BotCommand("agent", "🤖 Agent: qo'ng'iroq / hisob ulash"),
@@ -481,6 +554,7 @@ class BrainBot:
         app.add_handler(CommandHandler("new", self.on_new))
         app.add_handler(CommandHandler("agent", self.on_agent))
         app.add_handler(CallbackQueryHandler(self.on_agent_button, pattern=r"^ag:"))
+        app.add_handler(CallbackQueryHandler(self.on_outreach_button, pattern=r"^ox:"))
         app.add_handler(MessageHandler(filters.CONTACT, self.on_contact))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))

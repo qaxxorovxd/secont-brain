@@ -1,5 +1,6 @@
 """User-agent: a second Telegram *user* account that phones the owner,
 plays a spoken reminder and repeats it while the owner says "ha".
+On the owner's order it also writes to / phones other people, and forwards their replies.
 
 Uses Telethon (MTProto login) + py-tgcalls (private voice calls).
 The session string is kept in .state/agent.json — never in the brain repo.
@@ -10,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import wave
 from pathlib import Path
@@ -19,7 +21,7 @@ from .ai import pcm_to_wav
 log = logging.getLogger(__name__)
 
 try:  # optional: the bot still works without call support
-    from telethon import TelegramClient, functions, types as tl
+    from telethon import TelegramClient, events, functions, types as tl
     from telethon.errors import SessionPasswordNeededError
     from telethon.sessions import StringSession
     from pytgcalls import PyTgCalls, filters as fl
@@ -33,6 +35,7 @@ except Exception as e:  # pragma: no cover
 REC_RATE, REC_CHANNELS = AudioQuality.HIGH.value if not IMPORT_ERROR else (48000, 2)
 LISTEN_SECONDS = 6
 MAX_REPEATS = 3
+DAILY_OUTREACH_LIMIT = 30  # protects the agent account from Telegram spam limits
 
 
 class Agent:
@@ -40,6 +43,8 @@ class Agent:
         self.api_id, self.api_hash, self.default_phone = api_id, api_hash, phone
         self.ai = ai  # Assistant: tts() / yes_no()
         self.file = state_dir / "agent.json"
+        self.contacts_file = state_dir / "contacts.json"  # people Marin reached for the owner
+        self.on_reply = None  # async (contact: dict, text: str) -> None, set by the bot
         self.audio_dir = state_dir / "audio"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.client: "TelegramClient | None" = None
@@ -129,6 +134,13 @@ class Agent:
             fut = self._ended.get(u.chat_id)
             if fut and not fut.done():
                 fut.set_result(False)
+
+        @self.client.on(events.NewMessage(incoming=True))
+        async def _incoming(ev):
+            try:
+                await self._forward_reply(ev)
+            except Exception:
+                log.exception("forwarding reply failed")
 
         self.ready = True
 
@@ -299,21 +311,22 @@ class Agent:
                 return "ulanib bo'lmadi"
         return "band (boshqa qo'ng'iroqda)"
 
-    async def call(self, uid: int, text: str) -> str:
-        """Phone the owner, read `text`, then 'Qaytaraymi?' → repeat on 'ha'.
-        Returns a short status for the chat. Never hangs: the whole call is capped at 5 min."""
+    async def call(self, uid: int, text: str, owner: bool = True) -> str:
+        """Phone the owner (or, owner=False, an already resolved user), read `text`, then
+        'Qaytaraymi?' → repeat on 'ha'. Returns a short status for the chat.
+        Never hangs: the whole call is capped at 5 min."""
         if not self.ready:
             return "agent ulanmagan"
         async with self.lock:
             try:
-                return await asyncio.wait_for(self._call(uid, text), timeout=300)
+                return await asyncio.wait_for(self._call(uid, text, owner), timeout=300)
             except asyncio.TimeoutError:
                 log.warning("call %s: timed out, hanging up", uid)
                 await self._hangup(uid)
                 return "vaqt tugadi"
 
-    async def _call(self, uid: int, text: str) -> str:
-        if not await self._owner_ready(uid):
+    async def _call(self, uid: int, text: str, owner: bool = True) -> str:
+        if owner and not await self._owner_ready(uid):
             return "owner_unknown"
         msg = await self._audio(text.rstrip(".!?") + ". Qaytaraymi?", f"msg-{int(time.time())}")
         # v1 was made with the instruction-reading prompt; a full sentence is also read more reliably
@@ -359,6 +372,114 @@ class Agent:
         log.info("call %s: done, heard=%s frames=%d", uid, heard, self._frames_seen.get(uid, 0))
         repeats = heard.count("yes")
         last = heard[-1] if heard else ("siz qo'yib qo'ydingiz" if uid in self._gone else "")
-        note = {"no": "kerak emas dedingiz", "unclear": "javobingiz tushunilmadi",
-                "no_audio": "⚠️ ovozingiz eshitilmadi", "hung_up": "siz qo'yib qo'ydingiz"}.get(last, last)
+        if owner:
+            note = {"no": "kerak emas dedingiz", "unclear": "javobingiz tushunilmadi",
+                    "no_audio": "⚠️ ovozingiz eshitilmadi", "hung_up": "siz qo'yib qo'ydingiz"}.get(last, last)
+        else:
+            note = {"no": "qaytarish shart emas dedi", "unclear": "javobi tushunilmadi",
+                    "no_audio": "ovozi eshitilmadi", "hung_up": "o'zi qo'yib qo'ydi"}.get(last, last)
         return "gaplashildi" + (f", {repeats} marta qaytarildi" if repeats else "") + (f" · {note}" if note else "")
+
+    # ---------- reaching other people (on the owner's order) ----------
+    def contacts(self) -> dict:
+        return json.loads(self.contacts_file.read_text(encoding="utf-8")) if self.contacts_file.exists() else {}
+
+    def _save_contacts(self, data: dict) -> None:
+        self.contacts_file.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        try:
+            os.chmod(self.contacts_file, 0o600)
+        except OSError:
+            pass
+
+    def _remember(self, user, via: str) -> dict:
+        data = self.contacts()
+        name = " ".join(x for x in (user.first_name, user.last_name) if x) or via
+        c = {"id": user.id, "hash": user.access_hash, "name": name,
+             "username": user.username or "", "phone": user.phone or "", "via": via}
+        data[str(user.id)] = c
+        self._save_contacts(data)
+        return c
+
+    def _count_today(self) -> int:
+        """Increment and return today's outreach counter."""
+        today = time.strftime("%Y-%m-%d")
+        st = self._load().get("outreach", {})
+        n = (st.get("n", 0) if st.get("day") == today else 0) + 1
+        self._save(outreach={"day": today, "n": n})
+        return n
+
+    async def resolve(self, target: str):
+        """@username / t.me link / +phone / name of someone reached before → Telegram user (or None)."""
+        c, t = self.client, target.strip()
+        m = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{4,32})", t)
+        digits = re.sub(r"[^\d+]", "", t)
+        # a bare word is a username only if it looks like one (has _ or a digit); a plain name like
+        # "Sardor" must never resolve to some random public @Sardor
+        bare_user = re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", t) and re.search(r"[_\d]", t)
+        try:
+            if m or bare_user:
+                ent = await c.get_entity(m.group(1) if m else t)
+                return ent if isinstance(ent, tl.User) and not ent.bot else None
+            if len(digits.lstrip("+")) >= 9:
+                r = await c(functions.contacts.ImportContactsRequest([tl.InputPhoneContact(
+                    client_id=0, phone=digits, first_name=t, last_name="")]))
+                return r.users[0] if r.users else None
+        except Exception as e:
+            log.info("resolve %s failed: %s", target, e)
+            return None
+        # a name: someone Marin already reached
+        key = t.lower()
+        for cc in self.contacts().values():
+            if key and (key in cc["name"].lower() or key == cc["username"].lower()):
+                self.client.session.process_entities(tl.contacts.ResolvedPeer(
+                    peer=tl.PeerUser(cc["id"]), chats=[],
+                    users=[tl.User(id=cc["id"], access_hash=cc["hash"])]))
+                return await c.get_entity(cc["id"])
+        return None
+
+    async def reach(self, target: str, intro: str, message: str, call: bool) -> dict:
+        """Write `intro` to the person, phone them and speak intro+message; if the call does not
+        go through, send `message` as text. Returns {"who", "steps"} for the owner's report."""
+        if not self.ready:
+            return {"who": target, "steps": ["⚠️ agent ulanmagan (/agent)"]}
+        if self._count_today() > DAILY_OUTREACH_LIMIT:
+            return {"who": target, "steps": [f"⚠️ kunlik limit ({DAILY_OUTREACH_LIMIT} ta) tugadi"]}
+        user = await self.resolve(target)
+        if not user:
+            return {"who": target, "steps": ["⚠️ Telegramda topilmadi (username yoki raqamni tekshiring)"]}
+        contact = self._remember(user, target)
+        who = contact["name"] + (f" (@{contact['username']})" if contact["username"] else "")
+        steps: list[str] = []
+        if not call:
+            await self.client.send_message(user, f"{intro}\n\n{message}")
+            return {"who": who, "steps": ["✉️ xabar yozildi"], "contact": contact}
+        await self.client.send_message(user, intro + "\nHozir sizga qo'ng'iroq qilib, xabarni aytib beraman.")
+        steps.append("✉️ tanishtiruv yozildi")
+        try:
+            status = await self.call(user.id, f"{intro} {message}", owner=False)
+        except Exception as e:
+            log.exception("outreach call failed")
+            status = f"qo'ng'iroq imkoni yo'q ({type(e).__name__})"
+        steps.append(f"📞 {status}")
+        if not status.startswith("gaplashildi"):
+            await self.client.send_message(
+                user, f"Qo'ng'iroq qila olmadim, shuning uchun xabarni yozib qoldiraman:\n\n{message}")
+            steps.append("✉️ xabar matn qilib yuborildi")
+        return {"who": who, "steps": steps, "contact": contact}
+
+    async def _forward_reply(self, ev) -> None:
+        """A person Marin reached writes back → hand it to the owner. Marin never chats with them herself."""
+        if not ev.is_private or not self.on_reply:
+            return
+        c = self.contacts().get(str(ev.sender_id))
+        if not c:
+            return
+        text = ev.raw_text or ""
+        if ev.voice or ev.audio:
+            data = await ev.download_media(bytes)
+            heard = await asyncio.to_thread(self.ai.transcribe, data, "audio/ogg")
+            text = f"🎙 {heard}" if heard else "🎙 (ovozli xabar)"
+        elif ev.media and not text:
+            text = "📎 (fayl yoki rasm yubordi)"
+        if text:
+            await self.on_reply(c, text)

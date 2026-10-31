@@ -87,6 +87,21 @@ RULES. The system adds "Qaytaraymi?" at the end, so don't add it yourself.
 Example — owner: "telefon qilib ertaroq uxlang de" → phone_call("Assalomu alaykum, janob! Men Marin.
 Iltimos, bugun biroz ertaroq dam oling, charchagandirsiz. O'zingizni ehtiyot qiling.")
 
+CONTACTING OTHER PEOPLE (via the agent account): "@ali ga ayt …", "+99890… ga qo'ng'iroq qil va …",
+"Sardorga yoz: …" → contact_person(target, message, call). target = the @username / phone / t.me link
+exactly as given (or the name of someone you reached before). call=false when the owner only says
+yoz / xabar yubor / write; otherwise (ayt, yetkaz, bog'lan, qo'ng'iroq qil, call) call=true.
+`message` = what to tell THAT person: written by you, Marin, addressed to them politely ("siz"),
+in the language the owner wants (default Uzbek Latin), 1–4 sentences, conveying ONLY what janob asked.
+You speak FOR him, so talk about him in the 3rd person by first name + "aka" (e.g. "Axmadjon aka ertaga
+kitobni olib keladi"), never "men/biz" as if you were him, and never call him "janob" to strangers.
+Do NOT add a greeting or introduction — "Assalomu alaykum! Siz bilan Marin, … AI assistenti" is added
+automatically. PRIVACY (strict): never put janob's personal data in `message` — his phone, address,
+location, schedule, tasks, notes, facts, health, money, passwords, accounts, server, other people's
+info — unless janob explicitly asked to share that exact item. Every message is privacy-checked before
+sending; if it is held, tell the owner briefly. Reply to the owner with one short line ("📨 Yuborilmoqda…").
+When a person's reply was forwarded and the owner says "unga javob yoz: …" → contact_person(call=false).
+
 LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for a file / txt / pdf /
 "to'liq" export, call send_file with the full well-formatted Markdown content and reply with one short line.
 """
@@ -138,6 +153,22 @@ def pcm_to_wav(pcm: bytes, rate: int, channels: int) -> bytes:
     return buf.getvalue()
 
 
+# never sent to a third person, whatever the command says
+SECRET_PATTERNS = [
+    (r"\b\d{8,10}:AA[\w-]{20,}", "bot token"),
+    (r"AIza[\w-]{20,}", "API kalit"),
+    (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "GitHub token"),
+    (r"\bsk-[A-Za-z0-9_-]{20,}", "API kalit"),
+    (r"(?i)\b(parol|password|pass|pin|cvv|api[_ ]?key|token|secret)\b\s*[:=-]\s*\S{4,}", "parol/kalit"),
+]
+# contact data: allowed only when the owner typed it himself in the command
+PERSONAL_PATTERNS = [
+    (r"\+?\d[\d\s()-]{7,}\d", "raqam"),
+    (r"[\w.+-]+@[\w-]+\.[\w.]+", "email"),
+    (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP manzil"),
+]
+
+
 def ddg_search(query: str, limit: int = 6) -> list[str]:
     """Very basic keyless web search (DuckDuckGo HTML) → "title — snippet (url)" lines."""
     try:
@@ -178,11 +209,14 @@ class Reply:
     text: str
     files: list[dict] = field(default_factory=list)  # {"title","content","format"}
     calls: list[str] = field(default_factory=list)  # texts to speak in a phone call
+    outreach: list[dict] = field(default_factory=list)  # {"target","message","call","command"}
 
 
 class Assistant:
-    def __init__(self, brain: Brain, api_key: str, models: list[str], voice: str = "Leda"):
+    def __init__(self, brain: Brain, api_key: str, models: list[str], voice: str = "Leda",
+                 owner_name: str = ""):
         self.brain = brain
+        self._owner_name = owner_name
         self.voice = voice
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
             timeout=45_000, retry_options=types.HttpRetryOptions(attempts=1)))
@@ -309,6 +343,57 @@ class Assistant:
             types.GenerateContentConfig(temperature=0),
         )
         return (r.text or "").strip()
+
+    # ---------- talking to other people ----------
+    def owner_name(self) -> str:
+        if self._owner_name:
+            return self._owner_name
+        m = re.search(r"Ismi:\s*\**([^*\n]+)", self.brain.profile())
+        return m.group(1).strip() if m else "egam"
+
+    def intro(self) -> str:
+        return (f"Assalomu alaykum! Siz bilan Marin, {self.owner_name()}ning shaxsiy AI assistenti "
+                "bog'lanyapti.")
+
+    def privacy_check(self, command: str, message: str) -> dict:
+        """Is `message` safe to send to a third person on the owner's behalf?
+        Layer 1: patterns (secrets → hard block; contact data → allowed only if the owner typed it).
+        Layer 2: an AI reviewer that knows the owner's private data. Fails closed.
+        Returns {"ok": bool, "hard": bool, "reasons": [..]}."""
+        reasons: list[str] = []
+        for pat, what in SECRET_PATTERNS:
+            if re.search(pat, message):
+                return {"ok": False, "hard": True, "reasons": [f"maxfiy {what} bor"]}
+        cmd = re.sub(r"\s+", "", command)
+        for pat, what in PERSONAL_PATTERNS:
+            for m in re.finditer(pat, message):
+                if re.sub(r"\s+", "", m.group(0)) not in cmd:
+                    reasons.append(f"{what}: {m.group(0)}")
+        private = (f"OWNER PROFILE:\n{self.brain.profile()[-3000:]}\n\nFACTS:\n{self.brain.facts()[-3000:]}\n\n"
+                   "TASKS:\n" + "\n".join(f"- {t.get('title')} {t.get('person', '')} {t.get('due', '')}"
+                                         for t in self.brain.context_tasks()[-40:]))
+        prompt = (
+            "You are a strict privacy reviewer. An AI assistant is about to send OUTGOING to a third person "
+            "on behalf of its owner. Allowed: the owner's name, the assistant introducing itself, and exactly "
+            "the content the OWNER COMMAND asked to deliver (rephrased politely). NOT allowed: any other "
+            "personal or private information about the owner or anyone else (phone, address, location, "
+            "plans/schedule, tasks, notes, health, money, accounts, passwords, workplace/server details, "
+            "other people's data), anything from PRIVATE DATA that the command did not ask to share, "
+            "insults/threats, or content that changes the meaning of the command. If the OWNER COMMAND "
+            "explicitly asks to share a specific item (e.g. 'give him my number: +998…'), sharing exactly that "
+            "item is ALLOWED.\n\n"
+            f"PRIVATE DATA (must not leak):\n{private}\n\nOWNER COMMAND:\n{command}\n\nOUTGOING:\n{message}\n\n"
+            'Answer JSON only: {"safe": true|false, "problems": ["short reason in Uzbek", ...]}')
+        try:
+            _, r = self._generate(prompt, types.GenerateContentConfig(
+                temperature=0, response_mime_type="application/json"))
+            verdict = json.loads(r.text or "{}")
+            if not verdict.get("safe", False):
+                reasons += [str(x) for x in verdict.get("problems") or ["AI tekshiruvchi xavfli deb topdi"]]
+        except Exception as e:
+            log.warning("privacy check failed: %s", e)
+            reasons.append("AI tekshiruv ishlamadi — xavfsizlik uchun to'xtatildi")
+        return {"ok": not reasons, "hard": False, "reasons": reasons[:5]}
 
     # ---------- web search ----------
     def web_search(self, query: str) -> dict:
@@ -440,6 +525,17 @@ class Assistant:
             companies, news, prices, exchange rates, weather, definitions, how-to."""
             return self.web_search(query)
 
+        outreach: list[dict] = []
+
+        def contact_person(target: str, message: str, call: bool = True) -> str:
+            """Reach ANOTHER person for the owner via the agent Telegram account: writes an intro,
+            phones them and speaks `message` (call=true), and sends it as text if the call fails.
+            target: @username, +phone, t.me link, or the name of someone reached before.
+            message: your polite words TO THAT PERSON with only what janob asked to convey; no greeting
+            or intro (auto-added); never janob's private data unless he asked to share that exact item."""
+            outreach.append({"target": target, "message": message.strip(), "call": bool(call), "command": text})
+            return "queued: privacy check, then send"
+
         phone_calls: list[str] = []
 
         def phone_call(message: str) -> str:
@@ -458,7 +554,7 @@ class Assistant:
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
                  remember_fact, update_fact, remember_rule, forget_rule,
                  save_note, update_note, read_note, search_brain, web_search, update_profile,
-                 send_file, phone_call]
+                 send_file, phone_call, contact_person]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(
@@ -492,4 +588,4 @@ class Assistant:
 
         self.history += [user, types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
         self.history = self.history[-16:]
-        return Reply(reply, out, phone_calls)
+        return Reply(reply, out, phone_calls, outreach)

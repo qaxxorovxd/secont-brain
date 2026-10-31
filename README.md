@@ -72,6 +72,23 @@ and asks *"Qaytaraymi?"* — say **"ha"** and it repeats (up to 3×).
 3. **/agent → 📞 Test qo'ng'iroq**. If the call doesn't ring: Settings → Privacy → Calls → allow the agent.
 
 You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq qilib eslat"*.
+
+### Contacting other people
+*"@ali_valiyev ga ayt, ertaga 10 da uchrashuv"* · *"+99890… ga yoz: kitobni olib kelaman"*
+
+1. Marin writes the message to that person (in the 3rd person: "Axmadjon aka … keladi").
+2. 🛡 **Privacy check** before anything is sent: secrets (tokens, keys, passwords) are always blocked;
+   phone numbers / emails / IPs pass only if you typed them in the command yourself; then an AI reviewer
+   compares the text with your profile, facts and tasks. Anything doubtful is held and shown to you with
+   **✅ Baribir yuborish / ❌ Bekor qilish**. If the reviewer is unavailable, nothing is sent (fail-closed).
+3. The agent writes *"Assalomu alaykum! Siz bilan Marin, <OWNER_NAME>ning shaxsiy AI assistenti
+   bog'lanyapti."*, phones them and speaks the message ("Qaytaraymi?" works for them too). If the call
+   fails, the message is sent as text. You get a report.
+4. Their replies to the agent (text or voice → transcribed) are forwarded to you. Marin never chats with
+   them on her own; say *"unga javob yoz: …"*.
+
+Plain names only match people Marin reached before (never a random public @username). Max 30 per day.
+Reached people are kept in `.state/contacts.json`.
 The session is stored in `.state/agent.json` (never in git). Server needs `ffmpeg`.
 
 ## Sync (`./brain` = separate private repo)
