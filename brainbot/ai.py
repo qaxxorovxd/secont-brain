@@ -93,14 +93,21 @@ exactly as given (or the name of someone you reached before). call=false when th
 yoz / xabar yubor / write; otherwise (ayt, yetkaz, bog'lan, qo'ng'iroq qil, call) call=true.
 `message` = what to tell THAT person: written by you, Marin, addressed to them politely ("siz"),
 in the language the owner wants (default Uzbek Latin), 1–4 sentences, conveying ONLY what janob asked.
-You speak FOR him, so talk about him in the 3rd person by first name + "aka" (e.g. "Axmadjon aka ertaga
-kitobni olib keladi"), never "men/biz" as if you were him, and never call him "janob" to strangers.
+You speak FOR him, so talk about him in the 3rd person (to others: "Axmadjon aka ertaga kitobni olib
+keladi"), never "men/biz" as if you were him, and never call him "janob" to strangers.
 Do NOT add a greeting or introduction — "Assalomu alaykum! Siz bilan Marin, … AI assistenti" is added
 automatically. PRIVACY (strict): never put janob's personal data in `message` — his phone, address,
 location, schedule, tasks, notes, facts, health, money, passwords, accounts, server, other people's
 info — unless janob explicitly asked to share that exact item. Every message is privacy-checked before
 sending; if it is held, tell the owner briefly. Reply to the owner with one short line ("📨 Yuborilmoqda…").
 When a person's reply was forwarded and the owner says "unga javob yoz: …" → contact_person(call=false).
+NAMES & FAMILY: the owner may name someone instead of giving a number: "onam", "dadamga", "akamga",
+"Sardorga". Find them in ADDRESS BOOK — names may be in English/Russian (onam/oyim/ayam → "Mother"/"Mom"/
+"Мама"; dadam/otam → "Father"/"Dad"/"Папа"; akam → "Brother"…) — and pass that exact saved name as
+target. If unsure, pass the owner's word as said ("onam"): the agent also matches family words itself.
+NEVER tell the owner someone is not found without calling contact_person first — it reports if not found.
+Speak to family naturally: to his parents call him "o'g'lingiz Axmadjon", to siblings "ukangiz/akangiz
+Axmadjon" (as fits), not "Axmadjon aka".
 
 LONG OUTPUT: if the answer would be longer than ~25 lines, or the owner asks for a file / txt / pdf /
 "to'liq" export, call send_file with the full well-formatted Markdown content and reply with one short line.
@@ -217,6 +224,7 @@ class Assistant:
                  owner_name: str = ""):
         self.brain = brain
         self._owner_name = owner_name
+        self.address_book = lambda: []  # names Marin can reach (set by the bot from the agent)
         self.voice = voice
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
             timeout=45_000, retry_options=types.HttpRetryOptions(attempts=1)))
@@ -433,6 +441,8 @@ class Assistant:
             f"TASKS (open + recently done):\n{json.dumps(tasks, ensure_ascii=False) if tasks else '(none)'}\n\n"
             f"FACTS:\n{facts or '(none)'}\n\n"
             f"NOTES INDEX (id: title):\n" + ("\n".join(notes) or "(none)") + "\n\n"
+            f"ADDRESS BOOK (people you can reach with contact_person):\n"
+            + (", ".join(self.address_book()) or "(empty / agent not linked)") + "\n\n"
             f"RECENT JOURNAL:\n{self.brain.recent_journal() or '(empty)'}"
         )
 

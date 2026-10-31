@@ -85,6 +85,7 @@ class BrainBot:
         self._held: dict[str, dict] = {}  # outreach waiting for the owner's approval
         self.app: Application | None = None
         self.agent.on_reply = self.on_person_reply
+        self.ai.address_book = self.agent.book_names
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():

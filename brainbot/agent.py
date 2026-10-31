@@ -37,6 +37,46 @@ LISTEN_SECONDS = 6
 MAX_REPEATS = 3
 DAILY_OUTREACH_LIMIT = 30  # protects the agent account from Telegram spam limits
 
+# family words the owner uses → words a contact may be saved under (uz / en / ru)
+RELATIONS = {
+    "mother": ["ona", "onam", "onajon", "onamga", "oyi", "oyim", "oyijon", "aya", "ayam", "ayajon",
+               "mama", "mamam", "mom", "mum", "mother", "мама", "мамочка", "мать", "ойи", "она"],
+    "father": ["ota", "otam", "otajon", "dada", "dadam", "dadajon", "papa", "dad", "father",
+               "папа", "отец", "ота", "дада"],
+    "brother": ["aka", "akam", "akajon", "uka", "ukam", "brother", "bro", "брат", "ака", "ука"],
+    "sister": ["opa", "opam", "opajon", "singil", "singlim", "sister", "sis", "сестра", "опа"],
+    "wife": ["xotin", "xotinim", "ayolim", "rafiqam", "wife", "жена"],
+    "husband": ["er", "erim", "turmush o'rtog'im", "husband", "муж"],
+    "grandmother": ["buvi", "buvim", "buvijon", "momo", "momom", "grandma", "grandmother", "бабушка"],
+    "grandfather": ["bobo", "bobom", "bobojon", "grandpa", "grandfather", "дедушка"],
+}
+
+
+def _low(s: str) -> str:
+    return (s or "").lower().replace("‘", "'").replace("’", "'").replace("ʻ", "'").strip()
+
+
+def match_name(query: str, names: list[str]) -> int:
+    """Index of the contact name matching `query` (name, part of it, or a family word), or -1."""
+    q = _low(query).lstrip("@")
+    q = q[:-2] if q.endswith(("ga", "ka", "qa")) and len(q) > 4 else q  # "onamga" → "onam"
+    low = [_low(n) for n in names]
+    for i, n in enumerate(low):  # exact, then contains
+        if q == n:
+            return i
+    for i, n in enumerate(low):  # a whole word of the name ("sardor" → "Sardor Aliyev")
+        if q and q in n.split():
+            return i
+    for i, n in enumerate(low):  # start of a word, 4+ letters (never "Alisher" → "Ali")
+        if len(q) >= 4 and any(w.startswith(q) for w in n.split()):
+            return i
+    for words in RELATIONS.values():
+        if q in words:
+            for i, n in enumerate(low):
+                if any(w in n.split() or w == n for w in words) or any(w in n for w in words if len(w) >= 4):
+                    return i
+    return -1
+
 
 class Agent:
     def __init__(self, api_id: int, api_hash: str, phone: str, state_dir: Path, ai):
@@ -45,6 +85,7 @@ class Agent:
         self.file = state_dir / "agent.json"
         self.contacts_file = state_dir / "contacts.json"  # people Marin reached for the owner
         self.on_reply = None  # async (contact: dict, text: str) -> None, set by the bot
+        self.book: list = []  # the agent account's own Telegram contacts (tl.User)
         self.audio_dir = state_dir / "audio"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.client: "TelegramClient | None" = None
@@ -105,7 +146,8 @@ class Agent:
                 self._save(session="")
                 return
             await self._start_calls()
-            log.info("agent ready as %s", self.me)
+            await self.refresh_book()
+            log.info("agent ready as %s, %d contacts", self.me, len(self.book))
         except Exception:
             log.exception("agent start failed")
 
@@ -179,6 +221,7 @@ class Agent:
         await self.stop()
         self.client = c
         await self._start_calls()
+        await self.refresh_book()
 
     def login_pending(self) -> bool:
         return bool(self._login)
@@ -427,15 +470,42 @@ class Agent:
         except Exception as e:
             log.info("resolve %s failed: %s", target, e)
             return None
-        # a name: someone Marin already reached
-        key = t.lower()
-        for cc in self.contacts().values():
-            if key and (key in cc["name"].lower() or key == cc["username"].lower()):
-                self.client.session.process_entities(tl.contacts.ResolvedPeer(
-                    peer=tl.PeerUser(cc["id"]), chats=[],
-                    users=[tl.User(id=cc["id"], access_hash=cc["hash"])]))
-                return await c.get_entity(cc["id"])
+        # a name or family word ("onam" → "Mother"): the agent's contacts, then people reached before
+        for attempt in range(2):
+            i = match_name(t, [self._name(u) for u in self.book])
+            if i >= 0:
+                return self.book[i]
+            if attempt == 0:
+                await self.refresh_book()  # maybe saved just now
+        reached = list(self.contacts().values())
+        i = match_name(t, [cc["name"] for cc in reached])
+        if i < 0:
+            i = next((k for k, cc in enumerate(reached) if cc["username"] and _low(t).lstrip("@") == _low(cc["username"])), -1)
+        if i >= 0:
+            cc = reached[i]
+            self.client.session.process_entities(tl.contacts.ResolvedPeer(
+                peer=tl.PeerUser(cc["id"]), chats=[],
+                users=[tl.User(id=cc["id"], access_hash=cc["hash"])]))
+            return await c.get_entity(cc["id"])
         return None
+
+    @staticmethod
+    def _name(u) -> str:
+        return " ".join(x for x in (u.first_name, u.last_name) if x) or (u.username or "")
+
+    async def refresh_book(self) -> None:
+        """Load the agent account's saved Telegram contacts (names Marin can be told to reach)."""
+        try:
+            r = await self.client(functions.contacts.GetContactsRequest(hash=0))
+            self.book = [u for u in getattr(r, "users", []) if not u.bot and not u.deleted]
+        except Exception as e:
+            log.warning("contacts load failed: %s", e)
+
+    def book_names(self) -> list[str]:
+        """Names only (no phone numbers) for Marin's context."""
+        names = [self._name(u) for u in self.book]
+        names += [cc["name"] for cc in self.contacts().values() if cc["name"] not in names]
+        return [n for n in names if n][:200]
 
     async def reach(self, target: str, intro: str, message: str, call: bool) -> dict:
         """Write `intro` to the person, phone them and speak intro+message; if the call does not
