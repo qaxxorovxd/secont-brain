@@ -19,7 +19,7 @@ import unicodedata
 import wave
 from pathlib import Path
 
-from .ai import pcm_to_wav
+from .ai import SECRET_PATTERNS, pcm_to_wav
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +89,8 @@ class Agent:
         self.contacts_file = state_dir / "contacts.json"  # people Marin reached for the owner
         self.on_reply = None  # async (contact: dict, text: str) -> None, set by the bot
         self.book: list = []  # the agent account's own Telegram contacts (tl.User)
+        self.owner_id: int | None = None  # set by the bot
+        self.tz = None  # set by the bot, for message times
         self.audio_dir = state_dir / "audio"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.client: "TelegramClient | None" = None
@@ -625,14 +627,20 @@ class Agent:
                 log.info("group %s not found: %s", name, e)
                 return None
         groups = [d async for d in self.client.iter_dialogs(limit=500) if d.is_group or d.is_channel]
-        titles = [_low(d.name) for d in groups]
+        i = self._match_dialog(name, groups)
+        return groups[i].entity if i >= 0 else None
+
+    @staticmethod
+    def _match_dialog(name: str, dialogs: list) -> int:
+        """Index of the dialog whose title matches `name`, or -1 (ambiguous → -1)."""
+        titles = [_low(d.name) for d in dialogs]
         # "TATU 2-kurs guruhi" / "Dasturchilar chatidagi" → drop the generic word
         q = re.sub(r"\b(guruh|gruppa|group|chat|kanal|channel|efir)\w*", " ", _low(name))
         q = re.sub(r"\s+", " ", q).strip(" '\"")
         for cand in (_low(name), q):
-            if cand in titles:
-                return groups[titles.index(cand)].entity
-        i = match_name(q or name, [d.name for d in groups])
+            if cand and cand in titles:
+                return titles.index(cand)
+        i = match_name(q or name, [d.name for d in dialogs])
         if i < 0 and q:  # every word of the query starts a word of the title ("IT Park" → "IT Park Uzbekistan")
             words = q.split()
             hits = [k for k, t in enumerate(titles) if all(any(w2.startswith(w) for w2 in t.split()) for w in words)]
@@ -640,7 +648,7 @@ class Agent:
         if i < 0:  # a title written inside a longer phrase; longest title wins
             hits = [k for k, t in enumerate(titles) if len(t) >= 4 and t in _low(name)]
             i = max(hits, key=lambda k: len(titles[k])) if hits else -1
-        return groups[i].entity if i >= 0 else None
+        return i
 
     async def group_post(self, group: str, text: str, voice: bool = False) -> dict:
         """Write `text` (or say it as a voice note) in a group/channel the agent is in."""
@@ -782,3 +790,174 @@ class Agent:
             text = "📎 (fayl yoki rasm yubordi)"
         if text:
             await self.on_reply(c, text, self.notify_allowed(c["id"]))
+
+    # ---------- Telegram tools (Marin acting with the agent account) ----------
+    OWNER_WORDS = {"menga", "me", "janob", "owner", "o'zimga", "ozimga", "myself", "men"}
+
+    async def _owner_entity(self):
+        if self.owner_id and await self._owner_ready(self.owner_id):
+            return await self.client.get_entity(self.owner_id)
+        return None
+
+    async def find_chat(self, name: str):
+        """Any chat by name: "menga" (the owner), @username / link, a dialog title, a contact or family word."""
+        t = (name or "").strip()
+        if _low(t) in self.OWNER_WORDS:
+            return await self._owner_entity()
+        if re.search(r"(?:t\.me/|@)[A-Za-z0-9_]{4,32}", t):
+            return await self.find_group(t)  # get_entity: works for users too
+        dialogs = [d async for d in self.client.iter_dialogs(limit=500)]
+        i = self._match_dialog(t, dialogs)
+        if i >= 0:
+            return dialogs[i].entity
+        return await self.resolve(t)
+
+    def _title(self, ent) -> str:
+        if ent is None:
+            return "?"
+        if self.owner_id and getattr(ent, "id", None) == self.owner_id:
+            return "janob"
+        return getattr(ent, "title", None) or self._name(ent)
+
+    def _fmt(self, m) -> dict:
+        d = m.date.astimezone(self.tz) if self.tz else m.date
+        who = "Marin (agent)" if m.out else self._title(m.sender)
+        text = m.raw_text or ""
+        if m.voice:
+            text = ("🎙 ovozli xabar " + text).strip()
+        elif m.media and not text:
+            text = "📎 media"
+        return {"id": m.id, "date": f"{d:%Y-%m-%d %H:%M}", "from": who, "text": text[:600]}
+
+    async def _pick(self, ent, which: str = "last", count: int = 1, query: str = "", sender: str = "any") -> list:
+        """Messages to act on: an id, the last `count`, or the last ones matching `query`.
+        sender: any | them (not the agent) | marin (only the agent's own)."""
+        count = max(1, min(int(count or 1), 20))
+        if str(which).strip().isdigit():
+            m = await self.client.get_messages(ent, ids=int(which))
+            return [m] if m else []
+        out = []
+        async for m in self.client.iter_messages(ent, limit=300, search=query or None):
+            if getattr(m, "action", None):  # service messages ("X joined")
+                continue
+            if (sender == "them" and m.out) or (sender == "marin" and not m.out):
+                continue
+            out.append(m)
+            if len(out) >= count:
+                break
+        return list(reversed(out))
+
+    async def tg_chats(self, query: str = "", unread_only: bool = False, limit: int = 25) -> list:
+        res = []
+        async for d in self.client.iter_dialogs(limit=300):
+            if unread_only and not d.unread_count:
+                continue
+            if query and self._match_dialog(query, [d]) < 0:
+                continue
+            kind = "kanal" if d.is_channel and not d.is_group else ("guruh" if d.is_group else "shaxs")
+            res.append({"chat": self._title(d.entity), "type": kind, "unread": d.unread_count})
+            if len(res) >= limit:
+                break
+        return res or ["(hech narsa)"]
+
+    async def tg_read(self, chat: str, limit: int = 15) -> dict:
+        ent = await self.find_chat(chat)
+        if not ent:
+            return {"error": f"'{chat}' topilmadi"}
+        limit = max(1, min(int(limit or 15), 50))
+        msgs = [self._fmt(m) async for m in self.client.iter_messages(ent, limit=limit)
+                if not getattr(m, "action", None)]
+        return {"chat": self._title(ent), "messages": list(reversed(msgs))}
+
+    async def tg_search(self, query: str, chat: str = "") -> dict:
+        if chat:
+            ent = await self.find_chat(chat)
+            if not ent:
+                return {"error": f"'{chat}' topilmadi"}
+            msgs = [self._fmt(m) async for m in self.client.iter_messages(ent, search=query, limit=15)]
+            return {"chat": self._title(ent), "messages": msgs or ["(topilmadi)"]}
+        out = []
+        async for m in self.client.iter_messages(None, search=query, limit=15):
+            f = self._fmt(m)
+            f["chat"] = self._title(await m.get_chat())
+            out.append(f)
+        return {"messages": out or ["(topilmadi)"]}
+
+    async def tg_forward(self, from_chat: str, to_chat: str = "menga", which: str = "last", count: int = 1,
+                         query: str = "", sender: str = "any") -> dict:
+        src, dst = await self.find_chat(from_chat), await self.find_chat(to_chat)
+        if not src:
+            return {"error": f"'{from_chat}' topilmadi"}
+        if not dst:
+            return {"error": f"'{to_chat}' topilmadi"}
+        msgs = await self._pick(src, which, count, query, sender)
+        if not msgs:
+            return {"error": "forward qilinadigan xabar topilmadi"}
+        to_owner = self.owner_id and getattr(dst, "id", None) == self.owner_id
+        if not to_owner:
+            for m in msgs:
+                for pat, what in SECRET_PATTERNS:
+                    if re.search(pat, m.raw_text or ""):
+                        return {"error": f"xabarda maxfiy {what} bor — begonaga forward qilinmaydi"}
+            if self._count_today() > DAILY_OUTREACH_LIMIT:
+                return {"error": f"kunlik limit ({DAILY_OUTREACH_LIMIT} ta) tugadi"}
+        await self.client.forward_messages(dst, msgs, src)
+        return {"forwarded": len(msgs), "from": self._title(src), "to": self._title(dst),
+                "messages": [self._fmt(m) for m in msgs][:5]}
+
+    async def tg_mark_read(self, chat: str) -> dict:
+        ent = await self.find_chat(chat)
+        if not ent:
+            return {"error": f"'{chat}' topilmadi"}
+        await self.client.send_read_acknowledge(ent)
+        return {"ok": True, "chat": self._title(ent)}
+
+    async def tg_react(self, chat: str, emoji: str = "👍", which: str = "last") -> dict:
+        ent = await self.find_chat(chat)
+        if not ent:
+            return {"error": f"'{chat}' topilmadi"}
+        msgs = await self._pick(ent, which, 1, sender="them")
+        if not msgs:
+            return {"error": "xabar topilmadi"}
+        await self.client(functions.messages.SendReactionRequest(
+            peer=ent, msg_id=msgs[0].id, reaction=[tl.ReactionEmoji(emoticon=emoji)]))
+        return {"ok": True, "chat": self._title(ent), "message": self._fmt(msgs[0]), "emoji": emoji}
+
+    async def tg_pin(self, chat: str, which: str = "last") -> dict:
+        ent = await self.find_chat(chat)
+        if not ent:
+            return {"error": f"'{chat}' topilmadi"}
+        msgs = await self._pick(ent, which, 1)
+        if not msgs:
+            return {"error": "xabar topilmadi"}
+        await self.client.pin_message(ent, msgs[0], notify=False)
+        return {"ok": True, "chat": self._title(ent), "pinned": self._fmt(msgs[0])}
+
+    async def tg_delete_own(self, chat: str, which: str = "last", count: int = 1) -> dict:
+        ent = await self.find_chat(chat)
+        if not ent:
+            return {"error": f"'{chat}' topilmadi"}
+        msgs = [m for m in await self._pick(ent, which, count, sender="marin") if m.out]
+        if not msgs:
+            return {"error": "Marin'ning o'chiriladigan xabari topilmadi (faqat o'z xabarlarini o'chiradi)"}
+        await self.client.delete_messages(ent, [m.id for m in msgs], revoke=True)
+        return {"deleted": len(msgs), "chat": self._title(ent)}
+
+    async def tg_join(self, link: str) -> dict:
+        m = re.search(r"t\.me/(?:\+|joinchat/)([\w-]+)", link)
+        if m:
+            r = await self.client(functions.messages.ImportChatInviteRequest(m.group(1)))
+            return {"joined": r.chats[0].title if r.chats else link}
+        u = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{4,32})", link)
+        if not u:
+            return {"error": "havola yoki @username kerak"}
+        ent = await self.client.get_entity(u.group(1))
+        await self.client(functions.channels.JoinChannelRequest(ent))
+        return {"joined": self._title(ent)}
+
+    async def tg_leave(self, chat: str) -> dict:
+        ent = await self.find_group(chat)
+        if not ent:
+            return {"error": f"'{chat}' guruh/kanal topilmadi"}
+        await self.client.delete_dialog(ent)
+        return {"left": self._title(ent)}

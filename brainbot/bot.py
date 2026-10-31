@@ -87,6 +87,9 @@ class BrainBot:
         self.agent.on_reply = self.on_person_reply
         self.ai.address_book = self.agent.book_names
         self.ai.reply_filter = self.agent.set_notify
+        self.ai.tg = self.run_tg
+        self.agent.owner_id, self.agent.tz = self.owner_chat, cfg.tz
+        self.loop: asyncio.AbstractEventLoop | None = None
         self.owner_file = cfg.state_dir / "owner.json"
         self.owner_chat: int | None = None
         if self.owner_file.exists():
@@ -111,6 +114,7 @@ class BrainBot:
 
     def _set_owner(self, chat_id: int) -> None:
         self.owner_chat = chat_id
+        self.agent.owner_id = chat_id
         self.owner_file.write_text(json.dumps({"chat_id": chat_id}))
 
     @staticmethod
@@ -392,6 +396,22 @@ class BrainBot:
         except Exception:
             pass
 
+    TG_ACTIONS = {"forward", "mark_read", "react", "pin", "delete_own", "join", "leave"}
+
+    def run_tg(self, name: str, **kw):
+        """Run agent.tg_<name> on the bot's event loop from Marin's worker thread."""
+        if not (self.agent.ready and self.loop):
+            return {"error": "agent ulanmagan (/agent)"}
+        fut = asyncio.run_coroutine_threadsafe(getattr(self.agent, f"tg_{name}")(**kw), self.loop)
+        try:
+            res = fut.result(timeout=90)
+        except Exception as e:
+            log.warning("tg_%s failed: %s", name, e)
+            res = {"error": f"{type(e).__name__}: {str(e)[:150]}"}
+        if name in self.TG_ACTIONS:
+            self.brain.log(f"[tg {name}] {json.dumps(kw, ensure_ascii=False)}\n→ {str(res)[:300]}", "tg")
+        return res
+
     def _background(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._call_tasks.add(task)  # keep a reference so the task isn't garbage-collected
@@ -546,6 +566,7 @@ class BrainBot:
 
     async def post_init(self, app: Application):
         self.app = app
+        self.loop = asyncio.get_running_loop()
         await self.agent.start()
         await app.bot.set_my_commands([
             BotCommand("agent", "🤖 Agent: qo'ng'iroq / hisob ulash"),

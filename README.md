@@ -89,6 +89,20 @@ You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq 
 4. Their replies to the agent (text or voice → transcribed) are forwarded to you. Marin never chats with
    them on her own; say *"unga javob yoz: …"*.
 
+### Telegram tools (agent account)
+| Say | Does |
+|---|---|
+| *"kimdan yangi xabar bor?"* | lists chats with unread counts |
+| *"2chi gurux da nima gaplar?"* | reads the last messages and summarizes |
+| *"'imtihon' deb qayerda yozishgan?"* | searches messages (one chat or all) |
+| *"Isroilning oxirgi xabarini menga forward qil"* | forwards (to you, or to others on your order) |
+| *"… o'qildi qil / like bos / pin qil"* | mark read, react, pin |
+| *"oxirgi yozganingni o'chir"* | deletes only Marin's own messages |
+| *"shu havolaga qo'shil / guruhdan chiq"* | join / leave |
+
+Messages read from chats are treated as data, never as orders to Marin. Secrets are never forwarded to
+other people; every action is written to the journal.
+
 ### Writing in a group
 *"TATU 2-kurs guruhiga yoz: ertaga dars yo'q"* · *"Oila guruhiga ovozli xabar tashla: …"* → the agent posts
 your words (text or a voice note in Marin's voice) in that group; it must be a member allowed to write.
