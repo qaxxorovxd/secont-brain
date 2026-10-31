@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import difflib
+import html as htmllib
 import io
 import json
 import logging
 import re
 import time
+import urllib.parse
+import urllib.request
 import wave
 from dataclasses import dataclass, field
 
@@ -33,6 +36,11 @@ default behaviour. When the owner tells you how to behave / address them / what 
 ("menga doim janob de", "har doim …", "hech qachon …", "meni … deb chaqir", "qoida: …") → call
 remember_rule with a short imperative rule, then confirm. To drop one → forget_rule.
 
+OWNER: the OWNER PROFILE in CONTEXT is the person you serve ("janob"). You know him — never say you don't.
+"Men kimman?", "<owner's name> kim?", "mening ismim / kasbim / ...?" → answer from OWNER PROFILE.
+When the owner tells you something lasting about HIMSELF ("men ... da o'qiyman", "mening kasbim ...",
+"tug'ilgan kunim ...") → update_profile (facts about OTHER people → remember_fact).
+
 LANGUAGE: reply in the language of the message (Uzbek Latin or English; mixed is fine). Uzbek → use Latin script.
 
 STYLE (very important):
@@ -52,8 +60,13 @@ WHAT TO DO WITH A MESSAGE (the raw message is ALREADY saved to the journal autom
    If several could match and it is genuinely unclear, ask one short question.
 3. A fact worth remembering (birthday, password hint, address, decision, price, someone said X) → remember_fact.
    Long content (lecture notes, ideas, lists, plans > ~5 lines) → save_note.
-4. A question → answer from CONTEXT; if not there, call search_brain (try 2–3 keyword variants,
-   including name stems, e.g. "Iroda", "referat"). Never invent. If nothing found: say so in one line.
+4. A question → NEVER reply "bilmayman / I don't know" without searching first:
+   a) answer from CONTEXT (OWNER PROFILE, RULES, TASKS, FACTS, NOTES, JOURNAL);
+   b) else search_brain (try 2–3 keyword variants, including name stems, e.g. "Iroda", "referat");
+   c) else, for anything public or general (people, places, companies, news, prices, exchange rates,
+      weather, definitions, how-to, "qidir", "internetdan top") → web_search. Give a short answer and
+      end with "🌐 " + 1–2 source site names. Do NOT save web results unless the owner asks.
+   Never invent. Only if all of these find nothing: say so in one line.
 5. When listing tasks of a group/person, ALWAYS show both what is left AND what is already done
    (with done date), e.g.:
    **Referat** — 1/5 bajarildi
@@ -123,6 +136,30 @@ def pcm_to_wav(pcm: bytes, rate: int, channels: int) -> bytes:
         w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+def ddg_search(query: str, limit: int = 6) -> list[str]:
+    """Very basic keyless web search (DuckDuckGo HTML) → "title — snippet (url)" lines."""
+    try:
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}),
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
+        html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+    except Exception as e:
+        log.warning("ddg failed: %s", e)
+        return []
+
+    def clean(x: str) -> str:
+        return re.sub(r"\s+", " ", htmllib.unescape(re.sub(r"<[^>]+>", "", x))).strip()
+
+    links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
+    snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
+    out = []
+    for i, (href, title) in enumerate(links[:limit]):
+        m = re.search(r"uddg=([^&]+)", href)
+        url = urllib.parse.unquote(m.group(1)) if m else href
+        out.append(f"{clean(title)} — {clean(snips[i]) if i < len(snips) else ''} ({url})")
+    return out
 
 
 def h(t):
@@ -273,6 +310,29 @@ class Assistant:
         )
         return (r.text or "").strip()
 
+    # ---------- web search ----------
+    def web_search(self, query: str) -> dict:
+        """Google Search grounding through Gemini; falls back to DuckDuckGo snippets.
+        Own model loop, so a search quota error never cools down the chat models."""
+        prompt = ("Search the web and answer briefly and factually (max ~10 lines). "
+                  f"Answer in the language of the query.\nQuery: {query}")
+        cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.2)
+        for model in [m for m in self.models if self.cooldown.get(m, 0) <= time.time()][:3]:
+            try:
+                r = self.client.models.generate_content(model=model, contents=prompt, config=cfg)
+                text = (r.text or "").strip()
+                if not text:
+                    continue
+                meta = r.candidates[0].grounding_metadata if r.candidates else None
+                sources = []
+                for ch in (getattr(meta, "grounding_chunks", None) or [])[:5]:
+                    if ch.web and ch.web.title and ch.web.title not in sources:
+                        sources.append(ch.web.title)
+                return {"answer": text[:3000], "sources": sources}
+            except Exception as e:
+                log.warning("web_search %s failed: %s", model, str(e)[:160])
+        return {"results": ddg_search(query) or ["no results"]}
+
     # ---------- main ----------
     def _context(self) -> str:
         now = self.brain.now()
@@ -283,6 +343,7 @@ class Assistant:
         rules_txt = "\n".join(f"- {r}" for r in rules) if rules else "(none yet)"
         return (
             f"NOW: {now:%Y-%m-%d %H:%M} ({WEEKDAYS_UZ[now.weekday()]} / {now:%A}), timezone {self.brain.tz.key}\n\n"
+            f"OWNER PROFILE — who janob is:\n{self.brain.profile()[-4000:] or '(empty)'}\n\n"
             f"RULES — the owner's standing orders, FOLLOW STRICTLY:\n{rules_txt}\n\n"
             f"TASKS (open + recently done):\n{json.dumps(tasks, ensure_ascii=False) if tasks else '(none)'}\n\n"
             f"FACTS:\n{facts or '(none)'}\n\n"
@@ -369,6 +430,16 @@ class Assistant:
             """Keyword search across ALL tasks (any age/status), facts, notes and the full journal."""
             return b.search(query) or ["no results"]
 
+        def update_profile(info: str) -> str:
+            """Add one lasting fact about the OWNER himself to his profile (one sentence, e.g.
+            "TATU 2-kurs talabasi"). Not for other people — use remember_fact for them."""
+            return "ok" if b.add_to_profile(info) else "already in profile"
+
+        def web_search(query: str) -> dict:
+            """Search the internet. Use for public/general info not in the brain: people, places,
+            companies, news, prices, exchange rates, weather, definitions, how-to."""
+            return self.web_search(query)
+
         phone_calls: list[str] = []
 
         def phone_call(message: str) -> str:
@@ -386,7 +457,8 @@ class Assistant:
 
         tools = [add_task, complete_task, reopen_task, cancel_task, update_task, list_tasks,
                  remember_fact, update_fact, remember_rule, forget_rule,
-                 save_note, update_note, read_note, search_brain, send_file, phone_call]
+                 save_note, update_note, read_note, search_brain, web_search, update_profile,
+                 send_file, phone_call]
 
         user = types.Content(role="user", parts=[types.Part.from_text(text=text)])
         config = types.GenerateContentConfig(

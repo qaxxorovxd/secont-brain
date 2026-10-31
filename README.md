@@ -32,6 +32,10 @@ Bot:  Referat — 1/5 bajarildi
 - 🪄 **Standing rules** — tell her "menga doim janob de" / "soat 23 dan keyin qo'ng'iroq qilma" and she
   saves it to `brain/rules.md` and follows it from then on (`remember_rule` / `forget_rule`)
 - 🎙 Phone calls use a configurable youthful voice (`TTS_VOICE`, default `Leda`)
+- 👤 **Owner profile** — `brain/profile.md` says who you are; always in context, so "men kimman?" just works.
+  Tell her lasting facts about yourself and she adds them (`update_profile`)
+- 🌐 **Web search** — when the brain has no answer she searches the internet (Gemini Google Search
+  grounding, falling back to keyless DuckDuckGo) instead of saying "bilmayman"
 
 ## Setup
 ```bash
@@ -90,6 +94,8 @@ brain/
   journal/2026/2026-10.md   every message, timestamped (append-only)
   tasks.json                tasks: person, group, due, remind_at, status, done_at
   facts.md                  short facts
+  profile.md                who the owner is (always in context)
+  rules.md                  standing orders
   notes/*.md                longer notes
   files/2026-10/…           photos & documents you sent
 ```

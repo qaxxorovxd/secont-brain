@@ -55,6 +55,7 @@ class Brain:
         self.tasks_path = root / "tasks.json"
         self.facts_path = root / "facts.md"
         self.rules_path = root / "rules.md"
+        self.profile_path = root / "profile.md"
 
     # ---------- helpers ----------
     def now(self) -> datetime:
@@ -237,6 +238,20 @@ class Brain:
         return True
 
     # ---------- notes ----------
+    # ---------- owner profile (who the owner is; always in context) ----------
+    def profile(self) -> str:
+        return self.profile_path.read_text(encoding="utf-8") if self.profile_path.exists() else ""
+
+    def add_to_profile(self, info: str) -> bool:
+        info = info.strip()
+        with self.lock:
+            old = self.profile() or "# Egasi haqida\n"
+            if norm(info) in norm(old):
+                return False
+            self._write(self.profile_path, old.rstrip("\n") + f"\n- {info}\n")
+        self._changed("profile")
+        return True
+
     def _note_path(self, note_id: str) -> Path:
         return self.root / "notes" / f"{Path(note_id).stem}.md"
 
@@ -310,6 +325,9 @@ class Brain:
         for line in self.facts().splitlines():
             if (s := score(line)):
                 hits.append((s + 1, line[3:13], "FACT " + line))
+        for line in self.profile().splitlines():
+            if (s := score(line)):
+                hits.append((s + 2, "", "PROFILE " + line))
         for p in (self.root / "notes").glob("*.md"):
             txt = p.read_text(encoding="utf-8")
             if (s := score(txt)):
