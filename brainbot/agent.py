@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import wave
 from pathlib import Path
@@ -509,7 +510,7 @@ class Agent:
 
     async def reach(self, target: str, intro: str, message: str, call: bool) -> dict:
         """Write `intro` to the person, phone them and speak intro+message; if the call does not
-        go through, send `message` as text. Returns {"who", "steps"} for the owner's report."""
+        go through, send it as a voice note (text if that fails). Returns {"who", "steps"}."""
         if not self.ready:
             return {"who": target, "steps": ["⚠️ agent ulanmagan (/agent)"]}
         if self._count_today() > DAILY_OUTREACH_LIMIT:
@@ -532,10 +533,37 @@ class Agent:
             status = f"qo'ng'iroq imkoni yo'q ({type(e).__name__})"
         steps.append(f"📞 {status}")
         if not status.startswith("gaplashildi"):
-            await self.client.send_message(
-                user, f"Qo'ng'iroq qila olmadim, shuning uchun xabarni yozib qoldiraman:\n\n{message}")
-            steps.append("✉️ xabar matn qilib yuborildi")
+            caption = f"Qo'ng'iroq qila olmadim, shuning uchun ovozli xabar qoldiraman:\n\n{message}"
+            if await self.send_voice(user, f"{intro} {message}", caption):
+                steps.append("🎙 ovozli xabar yuborildi (matni bilan)")
+            else:
+                await self.client.send_message(
+                    user, f"Qo'ng'iroq qila olmadim, shuning uchun xabarni yozib qoldiraman:\n\n{message}")
+                steps.append("✉️ xabar matn qilib yuborildi")
         return {"who": who, "steps": steps, "contact": contact}
+
+    async def send_voice(self, user, text: str, caption: str = "") -> bool:
+        """Speak `text` with Marin's voice and send it as a Telegram voice note. False if it fails."""
+        stem = self.audio_dir / f"note-{int(time.time() * 1000)}"
+        wav, ogg = stem.with_suffix(".wav"), stem.with_suffix(".ogg")
+        try:
+            wav.write_bytes(await asyncio.to_thread(self.ai.tts, text))
+            ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg, "-y", "-loglevel", "error", "-i", str(wav), "-c:a", "libopus", "-b:a", "32k",
+                "-ac", "1", "-ar", "48000", str(ogg),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0 or not ogg.exists():
+                raise RuntimeError(err.decode(errors="replace")[-200:])
+            await self.client.send_file(user, str(ogg), voice_note=True, caption=caption[:1000])
+            return True
+        except Exception as e:
+            log.warning("voice note failed: %s", e)
+            return False
+        finally:
+            wav.unlink(missing_ok=True)
+            ogg.unlink(missing_ok=True)
 
     async def _forward_reply(self, ev) -> None:
         """A person Marin reached writes back → hand it to the owner. Marin never chats with them herself."""

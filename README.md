@@ -83,7 +83,8 @@ You can also just say *"menga hozir qo'ng'iroq qil"* or *"soat 10 da qo'ng'iroq 
    **✅ Baribir yuborish / ❌ Bekor qilish**. If the reviewer is unavailable, nothing is sent (fail-closed).
 3. The agent writes *"Assalomu alaykum! Siz bilan Marin, <OWNER_NAME>ning shaxsiy AI assistenti
    bog'lanyapti."*, phones them and speaks the message ("Qaytaraymi?" works for them too). If the call
-   fails, the message is sent as text. You get a report.
+   fails, it is sent as a **voice note** in her voice (with the text as caption; plain text if TTS fails).
+   You get a report.
 4. Their replies to the agent (text or voice → transcribed) are forwarded to you. Marin never chats with
    them on her own; say *"unga javob yoz: …"*.
 
